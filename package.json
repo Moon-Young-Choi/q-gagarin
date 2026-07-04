@@ -1,0 +1,31 @@
+{
+  "name": "q-gagarin",
+  "version": "1.0.0",
+  "description": "Upbit API Node.js playground.",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "ticker": "node src/rest/ticker.js",
+    "ticker:ws": "node src/ws/ticker.js",
+    "check": "node --check src/rest/ticker.js && node --check src/ws/ticker.js",
+    "test": "npm run check"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Moon-Young-Choi/q-gagarin.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Moon-Young-Choi/q-gagarin/issues"
+  },
+  "homepage": "https://github.com/Moon-Young-Choi/q-gagarin#readme",
+  "dependencies": {
+    "axios": "^1.18.1",
+    "ws": "^8.21.0"
+  }
+}
