@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { LiveTriangleState, parseFeeRate } = require("../live/liveState");
 const { UpbitWsOrderbookClient } = require("../upbit/wsOrderbookClient");
 const { loadRuntimeConfig } = require("../core/runtimeConfig");
@@ -15,7 +16,7 @@ const { checkRealRunReadiness } = require("../core/readinessChecker");
 
 async function writeJsonAtomic(filePath, payload) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tmpPath, `${JSON.stringify(payload, null, 2)}\n`);
   await fs.rename(tmpPath, filePath);
 }
