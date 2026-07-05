@@ -30,7 +30,7 @@ npm run baseline
 - No order submission, cancellation, fill tracking, risk guard, or real executor exists in the current implementation.
 - Live trading is disabled by default in `config/runtime.json`.
 - The runtime config is loaded and frozen at live-server startup.
-- The dashboard process does not receive an engine state object and only appends Start/Pause/Stop commands.
+- The dashboard process follows the engine's runtime snapshot plus lightweight delta files and appends mode-aware command requests for the engine.
 - The engine writes latest snapshots under `out/runtime/` and append-only NDJSON logs under `out/logs/`.
 - Default start assets are `KRW`, `BTC`, and `USDT`.
 - Observation depth is configured as `5`; validation depth is configured as `30`.

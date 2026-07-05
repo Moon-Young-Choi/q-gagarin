@@ -24,7 +24,7 @@ The engine refreshes private REST permission, account, and `orders/chance` state
 
 - Default execution mode is `LIMIT_IOC_AT_OBSERVED_BEST`.
 - `BEST_IOC` requires `enabledExecutionModes` to include `BEST_IOC` and `executionPolicy.allowBestIoc=true`.
-- Dashboard can only queue `Start`, `Pause`, and `Stop`.
+- Dashboard mode buttons queue `Start` with an explicit run mode (`OBSERVE`, `DRY_RUN`, or `REAL_GUARDED`) plus `Pause`, `Stop`, and emergency `Stop`.
 - Real order creation is refused while `liveTradingEnabled=false`.
 - `Q_GAGARIN_ALLOW_LIVE_TRADING=true` is required before a config with `liveTradingEnabled=true` can load.
 - Every real order rejection includes a machine-readable reason such as `MARKET_DATA_STALE`, `ORDER_CHANCE_STALE`, `PRIVATE_WS_DISCONNECTED`, or `ORDER_RATE_LIMIT`.

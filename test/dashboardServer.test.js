@@ -1,10 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
+const WebSocket = require("ws");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { createDashboardRequestHandler } = require("../src/live/dashboardServer");
+const { createDashboardRequestHandler, startDashboardServer } = require("../src/live/dashboardServer");
 const { AppendOnlyLogStore } = require("../src/core/appendOnlyLog");
 
 function listen(server) {
@@ -23,7 +24,7 @@ function close(server) {
   });
 }
 
-test("dashboard command API accepts only Start Pause Stop", async () => {
+test("dashboard command API queues commands and exposes command status", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-dashboard-"));
   const logStore = new AppendOnlyLogStore({ logDir: dir });
   const snapshotPath = path.join(dir, "snapshot.json");
@@ -47,13 +48,77 @@ test("dashboard command API accepts only Start Pause Stop", async () => {
       body: JSON.stringify({ command: "Resync" }),
     });
     const commands = await logStore.readAll("commands");
+    const acceptedPayload = await accepted.json();
+    const commandStatus = await fetch(`http://127.0.0.1:${port}/api/commands/${acceptedPayload.commandId}`)
+      .then((response) => response.json());
 
     assert.equal(accepted.status, 202);
     assert.equal(rejected.status, 400);
     assert.equal(commands.length, 1);
     assert.equal(commands[0].command, "Pause");
+    assert.equal(commandStatus.status.status, "queued");
   } finally {
     await close(server);
+  }
+});
+
+test("dashboard WebSocket sends one full-state then runtime deltas", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-dashboard-delta-"));
+  const snapshotPath = path.join(dir, "latest-snapshot.json");
+  const deltaPath = path.join(dir, "latest-delta.json");
+  await fs.writeFile(snapshotPath, JSON.stringify({
+    type: "full-state",
+    engineState: "RUNNING",
+    summary: { marketsLoaded: 1 },
+    cycles: [],
+    groups: [],
+  }));
+  const dashboard = await startDashboardServer({
+    port: 0,
+    snapshotPath,
+    deltaPath,
+    logDir: path.join(dir, "logs"),
+    pushIntervalMs: 25,
+  });
+  const messages = [];
+  const ws = new WebSocket(`${dashboard.url.replace("http:", "ws:")}/ws/live`);
+
+  try {
+    await new Promise((resolve, reject) => {
+      ws.on("message", (data) => {
+        messages.push(JSON.parse(data.toString("utf8")));
+        if (messages.some((message) => message.type === "full-state")) {
+          resolve();
+        }
+      });
+      ws.on("error", reject);
+    });
+
+    await fs.writeFile(deltaPath, JSON.stringify({
+      type: "delta",
+      sentAtEpochMs: Date.now(),
+      changedCycles: [],
+      summaryDelta: { marketsLoaded: 2 },
+      metrics: {},
+      stateDelta: { engineState: "RUNNING" },
+    }));
+
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timed out waiting for delta")), 1000);
+      ws.on("message", (data) => {
+        const message = JSON.parse(data.toString("utf8"));
+        if (message.type === "delta") {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+
+    assert.equal(messages[0].type, "hello");
+    assert.equal(messages.some((message) => message.type === "full-state"), true);
+  } finally {
+    ws.close();
+    await dashboard.close();
   }
 });
 

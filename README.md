@@ -63,7 +63,16 @@ The scanner does not submit orders. Reverse rows are calculated from their own r
 
 ## Live Dashboard
 
-Start the combined localhost engine and dashboard:
+Recommended live operation uses separate engine and dashboard processes so chart rendering and dashboard JSON work do not share the engine event loop:
+
+```bash
+npm run engine
+npm run dashboard
+```
+
+The dashboard reads `out/runtime/latest-snapshot.json` once for initial state and then follows lightweight deltas from `out/runtime/latest-delta.json`.
+
+For local development you can still start the combined localhost engine and dashboard:
 
 ```bash
 npm run triangles:live
@@ -83,14 +92,7 @@ PORT=4100 npm run triangles:live
 
 The browser reads from the local Node.js server only. Upbit market discovery, observation depth-5 and validation depth-30 orderbook WebSocket subscriptions, multiplier calculation, depth-aware candidate validation, caching, latency metrics, and capture saving are handled server-side. Captures are saved under `out/captures/`.
 
-Run the engine and dashboard as separate processes:
-
-```bash
-npm run engine
-npm run dashboard
-```
-
-The engine owns exchange connections, orderbook stores, strategy evaluation, dry-run/real execution, private fill tracking, snapshots, and append-only logs. The dashboard serves static files, reads `out/runtime/latest-snapshot.json`, exposes log APIs, and only queues `Start`, `Pause`, and `Stop` commands for the engine.
+The engine owns exchange connections, orderbook stores, strategy evaluation, dry-run/real execution, private fill tracking, snapshots, deltas, and append-only logs. The dashboard serves static files, reads the engine's runtime files, exposes log APIs, and queues Observe, Dry Run, Real Guarded, Pause, Stop, and Emergency Stop commands for the engine. Each queued command gets a command status record under `out/runtime/command-status/` so the UI can show whether the engine accepted or rejected it.
 
 Append-only NDJSON logs are written under `out/logs/`:
 

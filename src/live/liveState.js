@@ -140,10 +140,7 @@ function compactCycleForDelta(row) {
     strategyAccepted: row.strategyAccepted,
     strategyReason: row.strategyReason,
     executionFeasibility: row.executionFeasibility,
-    timingTrace: row.timingTrace,
     timingBreakdown: row.timingBreakdown,
-    legs: row.legs,
-    history: row.history,
     latency: row.latency,
     lastChangedMarket: row.lastChangedMarket,
     lastUpbitTimestampMs: row.lastUpbitTimestampMs,
@@ -733,7 +730,38 @@ class LiveTriangleState {
     return this.cycles.map((cycle) => this.cycleRows.get(cycle.cycleId)).filter(Boolean);
   }
 
+  refreshAgingCycles(now = new Date()) {
+    const nowMs = now.getTime();
+    const previousRows = new Map(this.cycleRows);
+    const rows = this.recalculateAll({
+      nowMs,
+      markDirty: false,
+      logDecision: false,
+    });
+
+    for (const row of rows) {
+      const previous = previousRows.get(row.cycleId);
+
+      if (
+        !previous ||
+        previous.status !== row.status ||
+        previous.staleReason !== row.staleReason ||
+        previous.unavailableReason !== row.unavailableReason ||
+        previous.validationStatus !== row.validationStatus ||
+        previous.validationReason !== row.validationReason ||
+        previous.strategyAccepted !== row.strategyAccepted ||
+        previous.strategyReason !== row.strategyReason ||
+        previous.executionFeasibility !== row.executionFeasibility
+      ) {
+        this.dirtyCycleIds.add(row.cycleId);
+      }
+    }
+
+    return this.dirtyCycleIds.size;
+  }
+
   consumeDelta(now = new Date()) {
+    this.lastCalculatedAt = now.toISOString();
     const dirtyIds = [...this.dirtyCycleIds];
     this.dirtyCycleIds.clear();
     const changedCycles = dirtyIds

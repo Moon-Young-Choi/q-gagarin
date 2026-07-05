@@ -3,8 +3,9 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { LiveTriangleState, parseFeeRate } = require("../live/liveState");
 const { UpbitWsOrderbookClient } = require("../upbit/wsOrderbookClient");
-const { loadRuntimeConfig } = require("../core/runtimeConfig");
+const { freezeRuntimeConfig, loadRuntimeConfig, RUN_MODES } = require("../core/runtimeConfig");
 const { AppendOnlyLogStore } = require("../core/appendOnlyLog");
+const { CommandStatusStore } = require("../core/commandStatusStore");
 const { RunStateMachine, STATES, normalizeCommand } = require("../core/runStateMachine");
 const { UpbitPrivateWsClient } = require("../exchanges/upbit/privateWsClient");
 const { UpbitExchangeRestClient } = require("../exchanges/upbit/exchangeRestClient");
@@ -25,11 +26,19 @@ class EngineRuntime {
   constructor(options = {}) {
     this.runtimeDir = options.runtimeDir || path.resolve(process.cwd(), "out", "runtime");
     this.snapshotPath = options.snapshotPath || path.join(this.runtimeDir, "latest-snapshot.json");
+    this.deltaPath = options.deltaPath || path.join(this.runtimeDir, "latest-delta.json");
     this.commandPollIntervalMs = options.commandPollIntervalMs || 500;
-    this.snapshotIntervalMs = options.snapshotIntervalMs || 1000;
-    this.fallbackIntervalMs = null;
+    this.snapshotIntervalMs = options.snapshotIntervalMs ||
+      Number.parseInt(process.env.FULL_SNAPSHOT_INTERVAL_MS || "10000", 10);
+    this.deltaIntervalMs = options.deltaIntervalMs ||
+      Number.parseInt(process.env.UI_DELTA_INTERVAL_MS || "250", 10);
+    this.agingSweepIntervalMs = options.agingSweepIntervalMs ||
+      Number.parseInt(process.env.AGING_SWEEP_INTERVAL_MS || "1000", 10);
     this.logStore = options.logStore || new AppendOnlyLogStore({
       logDir: options.logDir || path.resolve(process.cwd(), "out", "logs"),
+    });
+    this.commandStatusStore = options.commandStatusStore || new CommandStatusStore({
+      runtimeDir: this.runtimeDir,
     });
     this.runtimeConfig = options.runtimeConfig || loadRuntimeConfig({
       configPath: options.runtimeConfigPath,
@@ -59,6 +68,12 @@ class EngineRuntime {
     this.orderbookBatchSize = Number.parseInt(process.env.UPBIT_ORDERBOOK_BATCH_SIZE || "50", 10);
     this.orderbookDelayMs = Number.parseInt(process.env.UPBIT_ORDERBOOK_DELAY_MS || "200", 10);
     this.wsMarketsPerConnection = Number.parseInt(process.env.UPBIT_WS_MARKETS_PER_CONNECTION || "100", 10);
+    this.wsConnectionDelayMs = options.wsConnectionDelayMs !== undefined
+      ? options.wsConnectionDelayMs
+      : Number.parseInt(process.env.UPBIT_WS_CONNECTION_DELAY_MS || "1000", 10);
+    this.validationFeedStartDelayMs = options.validationFeedStartDelayMs !== undefined
+      ? options.validationFeedStartDelayMs
+      : Number.parseInt(process.env.UPBIT_VALIDATION_WS_START_DELAY_MS || "4000", 10);
     this.observationClient = options.observationClient || null;
     this.validationClient = options.validationClient || null;
     this.privateWsClient = options.privateWsClient || null;
@@ -95,8 +110,12 @@ class EngineRuntime {
     this.lastExecutionByCycleId = new Map();
     this.commandTimer = null;
     this.snapshotTimer = null;
+    this.deltaTimer = null;
     this.fallbackTimer = null;
+    this.validationStartTimer = null;
     this.processedCommandKeys = new Set();
+    this.startedAtEpochMs = options.startedAtEpochMs || Date.now();
+    this.lastAgingSweepAt = 0;
     this.started = false;
 
     this.state.setExecutionHandler((plan, metadata) => this.handleExecutionCandidate(plan, metadata));
@@ -104,6 +123,7 @@ class EngineRuntime {
 
   async initialize() {
     await this.logStore.ensureFiles();
+    await this.seedProcessedCommands();
 
     if (!this.started) {
       await this.state.initialize();
@@ -122,10 +142,12 @@ class EngineRuntime {
   createFeedClients() {
     this.observationClient = this.observationClient || new UpbitWsOrderbookClient(this.state.requiredMarkets || [], {
       chunkSize: this.wsMarketsPerConnection,
+      connectionDelayMs: this.wsConnectionDelayMs,
       orderbookUnit: this.runtimeConfig.observationOrderbookUnit,
     });
     this.validationClient = this.validationClient || new UpbitWsOrderbookClient(this.state.requiredMarkets || [], {
       chunkSize: this.wsMarketsPerConnection,
+      connectionDelayMs: this.wsConnectionDelayMs,
       orderbookUnit: this.runtimeConfig.validationOrderbookUnit,
     });
 
@@ -197,6 +219,11 @@ class EngineRuntime {
         this.logStore.append("errors", { source: "snapshot", message: error.message }).catch(() => {});
       });
     }, this.snapshotIntervalMs);
+    this.deltaTimer = setInterval(() => {
+      this.writeDelta().catch((error) => {
+        this.logStore.append("errors", { source: "delta", message: error.message }).catch(() => {});
+      });
+    }, Math.max(50, this.deltaIntervalMs));
     this.fallbackTimer = setInterval(() => {
       this.fallbackPoll().catch((error) => {
         this.logStore.append("errors", { source: "fallback", message: error.message }).catch(() => {});
@@ -209,32 +236,77 @@ class EngineRuntime {
   async stop() {
     if (this.commandTimer) clearInterval(this.commandTimer);
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
+    if (this.deltaTimer) clearInterval(this.deltaTimer);
     if (this.fallbackTimer) clearInterval(this.fallbackTimer);
     this.stopFeeds();
     await this.writeSnapshot();
   }
 
+  async seedProcessedCommands() {
+    const commands = await this.logStore.readAll("commands", { limit: 1000 });
+
+    for (const command of commands) {
+      const commandEpochMs = Date.parse(command.timestamp || "");
+
+      if (!Number.isFinite(commandEpochMs) || commandEpochMs <= this.startedAtEpochMs) {
+        this.processedCommandKeys.add(command.commandId || `${command.timestamp}:${command.command}`);
+      }
+    }
+  }
+
   startFeeds() {
     this.observationClient.start();
-    this.validationClient.start();
+    clearTimeout(this.validationStartTimer);
+    this.validationStartTimer = setTimeout(() => {
+      this.validationClient.start();
+    }, Math.max(0, this.validationFeedStartDelayMs));
     if (this.privateWsClient) {
       this.privateWsClient.start();
     }
   }
 
   stopFeeds() {
+    clearTimeout(this.validationStartTimer);
     if (this.observationClient) this.observationClient.stop();
     if (this.validationClient) this.validationClient.stop();
     if (this.privateWsClient) this.privateWsClient.stop();
   }
 
+  setRunMode(runMode) {
+    const requestedRunMode = String(runMode || "").trim().toUpperCase();
+
+    if (!RUN_MODES.has(requestedRunMode)) {
+      throw new Error(`Invalid runMode: ${runMode}`);
+    }
+
+    this.runtimeConfig = freezeRuntimeConfig({
+      ...this.runtimeConfig,
+      runMode: requestedRunMode,
+    }, {
+      allowLiveTrading: process.env.Q_GAGARIN_ALLOW_LIVE_TRADING === "true",
+    });
+    this.state.setRuntimeConfig(this.runtimeConfig);
+    return this.runtimeConfig.runMode;
+  }
+
   async applyCommand(commandInput, metadata = {}) {
     const command = normalizeCommand(commandInput);
     const previousState = this.machine.state;
+    const previousConfig = this.runtimeConfig;
+    let configChanged = false;
+
+    if (command === "Start" && metadata.runMode) {
+      this.setRunMode(metadata.runMode);
+      configChanged = true;
+    }
 
     if (command === "Start" && this.runtimeConfig.runMode === "REAL_GUARDED") {
       const readiness = await this.checkReadiness();
       if (!readiness.passed) {
+        if (configChanged) {
+          this.runtimeConfig = previousConfig;
+          this.state.setRuntimeConfig(previousConfig);
+        }
         await this.logStore.append("events", {
           type: "readiness.blocked",
           command,
@@ -245,7 +317,16 @@ class EngineRuntime {
       }
     }
 
-    const nextState = this.machine.apply(command);
+    let nextState;
+    try {
+      nextState = this.machine.apply(command);
+    } catch (error) {
+      if (configChanged) {
+        this.runtimeConfig = previousConfig;
+        this.state.setRuntimeConfig(previousConfig);
+      }
+      throw error;
+    }
 
     if (command === "Start" && nextState === STATES.RUNNING && previousState === STATES.STOPPED) {
       this.startFeeds();
@@ -257,14 +338,27 @@ class EngineRuntime {
     }
 
     this.state.engineState = nextState;
-    await this.logStore.append("events", {
+    const event = await this.logStore.append("events", {
       type: "engine.command",
       command,
       previousState,
       nextState,
+      runMode: this.runtimeConfig.runMode,
       ...metadata,
     });
+    if (metadata.commandId) {
+      await this.commandStatusStore.write(metadata.commandId, {
+        status: "accepted",
+        command,
+        previousState,
+        nextState,
+        runMode: this.runtimeConfig.runMode,
+        eventTimestamp: event.timestamp,
+        source: metadata.source || "dashboard",
+      });
+    }
     await this.writeSnapshot();
+    await this.writeDelta({ forceAgingSweep: true });
     return nextState;
   }
 
@@ -279,6 +373,8 @@ class EngineRuntime {
         await this.applyCommand(command.command, {
           commandId: command.commandId,
           source: command.source || "dashboard",
+          runMode: command.runMode,
+          emergency: command.emergency,
         });
       } catch (error) {
         await this.logStore.append("errors", {
@@ -287,6 +383,15 @@ class EngineRuntime {
           commandId: command.commandId,
           message: error.message,
         });
+        if (command.commandId) {
+          await this.commandStatusStore.write(command.commandId, {
+            status: "rejected",
+            command: command.command,
+            runMode: command.runMode,
+            source: command.source || "dashboard",
+            message: error.message,
+          });
+        }
       }
     }
   }
@@ -499,6 +604,67 @@ class EngineRuntime {
     };
   }
 
+  stateDelta(now = new Date()) {
+    const nowMs = now.getTime();
+
+    return {
+      engineState: this.state.engineState,
+      engine: this.machine.snapshot(),
+      lastCalculatedAt: this.state.lastCalculatedAt,
+      wsStatus: this.state.wsStatus,
+      feedStatus: {
+        observation: this.state.wsStatus,
+        validation: this.state.validationWsStatus,
+      },
+      runtimeConfig: this.runtimeConfig,
+      orderbookStores: this.state.getOrderbookStoreStatus(nowMs),
+      privateWsStatus: this.privateWsStatus,
+      readiness: this.readiness,
+      privateCacheStatus: {
+        orderChanceFresh: this.isOrderChanceFresh(),
+        accountBalanceFresh: this.isAccountBalanceFresh(),
+        orderChanceCacheUpdatedAt: this.orderChanceCacheUpdatedAt,
+        accountBalanceUpdatedAt: this.accountBalanceUpdatedAt,
+        restPermissions: this.restPermissions,
+      },
+      guardStatus: {
+        consecutiveFailures: this.riskGuard.consecutiveFailures,
+        openOrderCount: this.riskGuard.openOrderCount,
+        activeRealExecutionCount: this.activeRealExecutionCount,
+        maxConsecutiveFailures: this.runtimeConfig.executionPolicy.realRunLimits.maxConsecutiveFailures,
+        maxOpenOrders: this.runtimeConfig.executionPolicy.realRunLimits.maxOpenOrders,
+        maxCyclesPerMinute: this.runtimeConfig.executionPolicy.realRunLimits.maxCyclesPerMinute,
+        healthy:
+          this.riskGuard.consecutiveFailures < this.runtimeConfig.executionPolicy.realRunLimits.maxConsecutiveFailures &&
+          this.riskGuard.openOrderCount < this.runtimeConfig.executionPolicy.realRunLimits.maxOpenOrders,
+      },
+      execution: {
+        mode: this.runtimeConfig.runMode,
+        liveTradingEnabled: this.runtimeConfig.liveTradingEnabled,
+        dryRunBalances: this.dryRunExecutor.balances,
+        ...this.fillTracker.snapshot(),
+      },
+      eventLog: this.state.eventLog.slice(-200),
+    };
+  }
+
+  delta(options = {}) {
+    const now = options.now || new Date();
+    const nowMs = now.getTime();
+
+    if (options.forceAgingSweep || nowMs - this.lastAgingSweepAt >= this.agingSweepIntervalMs) {
+      this.state.refreshAgingCycles(now);
+      this.lastAgingSweepAt = nowMs;
+    }
+
+    const delta = this.state.consumeDelta(now);
+
+    return {
+      ...delta,
+      stateDelta: this.stateDelta(now),
+    };
+  }
+
   async checkReadiness() {
     const restPermissions = await this.refreshPrivateCaches();
     const snapshot = this.state.getSnapshot();
@@ -525,6 +691,12 @@ class EngineRuntime {
     const snapshot = this.snapshot();
     await writeJsonAtomic(this.snapshotPath, snapshot);
     return snapshot;
+  }
+
+  async writeDelta(options = {}) {
+    const delta = this.delta(options);
+    await writeJsonAtomic(this.deltaPath, delta);
+    return delta;
   }
 }
 

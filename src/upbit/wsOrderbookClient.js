@@ -58,8 +58,8 @@ class UpbitWsOrderbookClient extends EventEmitter {
     this.marketCodes = [...new Set(marketCodes)].sort();
     this.orderbookUnit = options.orderbookUnit || 1;
     this.chunkSize = options.chunkSize || 100;
-    this.connectionDelayMs = options.connectionDelayMs || 250;
-    this.reconnectMinMs = options.reconnectMinMs || 1000;
+    this.connectionDelayMs = options.connectionDelayMs || 1000;
+    this.reconnectMinMs = options.reconnectMinMs || 3000;
     this.reconnectMaxMs = options.reconnectMaxMs || 30000;
     this.pingIntervalMs = options.pingIntervalMs || 20000;
     this.connections = new Map();

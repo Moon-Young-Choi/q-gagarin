@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const { URL } = require("node:url");
 const WebSocket = require("ws");
 const { AppendOnlyLogStore } = require("../core/appendOnlyLog");
+const { CommandStatusStore } = require("../core/commandStatusStore");
 const { normalizeCommand } = require("../core/runStateMachine");
 const {
   readFilteredLogs,
@@ -105,6 +106,18 @@ async function readSnapshot(snapshotPath) {
   }
 }
 
+async function readDelta(deltaPath) {
+  try {
+    return JSON.parse(await fs.readFile(deltaPath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
 async function saveCapture(capturesDir, payload) {
   const { imageDataUrl, snapshot, timestamp } = payload;
 
@@ -130,6 +143,9 @@ function createDashboardRequestHandler(options) {
     publicDir = path.resolve(process.cwd(), "public"),
     capturesDir = path.resolve(process.cwd(), "out", "captures"),
     snapshotPath = path.resolve(process.cwd(), "out", "runtime", "latest-snapshot.json"),
+    commandStatusStore = new CommandStatusStore({
+      runtimeDir: path.dirname(snapshotPath),
+    }),
     plotlyPath = require.resolve("plotly.js-dist-min/plotly.min.js"),
     logStore = new AppendOnlyLogStore(),
     sseClients = new Set(),
@@ -216,14 +232,44 @@ function createDashboardRequestHandler(options) {
           return;
         }
 
+        const commandId = crypto.randomUUID();
         const record = await logStore.append("commands", {
           type: "engine.command.requested",
           command,
-          commandId: crypto.randomUUID(),
+          commandId,
+          runMode: payload.runMode,
+          emergency: payload.emergency === true,
           source: "dashboard",
         });
+        await commandStatusStore.write(commandId, {
+          status: "queued",
+          command,
+          runMode: payload.runMode,
+          emergency: payload.emergency === true,
+          source: "dashboard",
+          queuedAt: record.timestamp,
+        });
 
-        sendJson(res, 202, { ok: true, command: record.command, commandId: record.commandId });
+        sendJson(res, 202, {
+          ok: true,
+          command: record.command,
+          commandId: record.commandId,
+          runMode: record.runMode,
+          status: "queued",
+        });
+        return;
+      }
+
+      if (req.method === "GET" && requestUrl.pathname.startsWith("/api/commands/")) {
+        const commandId = requestUrl.pathname.slice("/api/commands/".length);
+        const status = await commandStatusStore.read(commandId);
+
+        if (!status) {
+          sendJson(res, 404, { ok: false, error: "Command status not found" });
+          return;
+        }
+
+        sendJson(res, 200, { ok: true, status });
         return;
       }
 
@@ -280,8 +326,12 @@ async function startDashboardServer(options = {}) {
   const port = options.port !== undefined ? options.port : Number.parseInt(process.env.PORT || "3099", 10);
   const host = options.host || "127.0.0.1";
   const snapshotPath = options.snapshotPath || path.resolve(process.cwd(), "out", "runtime", "latest-snapshot.json");
+  const deltaPath = options.deltaPath || path.resolve(process.cwd(), "out", "runtime", "latest-delta.json");
   const logStore = options.logStore || new AppendOnlyLogStore({
     logDir: options.logDir || path.resolve(process.cwd(), "out", "logs"),
+  });
+  const commandStatusStore = options.commandStatusStore || new CommandStatusStore({
+    runtimeDir: path.dirname(snapshotPath),
   });
   const sseClients = new Set();
   const liveWsClients = new Set();
@@ -290,9 +340,12 @@ async function startDashboardServer(options = {}) {
     ...options,
     snapshotPath,
     logStore,
+    commandStatusStore,
     sseClients,
   }));
-  const pushIntervalMs = options.pushIntervalMs || 1000;
+  const pushIntervalMs = options.pushIntervalMs ||
+    Number.parseInt(process.env.UI_PUSH_INTERVAL_MS || "250", 10);
+  let lastPushedDeltaEpochMs = 0;
 
   wsServer.on("connection", async (socket) => {
     liveWsClients.add(socket);
@@ -302,6 +355,16 @@ async function startDashboardServer(options = {}) {
       uiPushIntervalMs: pushIntervalMs,
     }));
     socket.send(JSON.stringify(await readSnapshot(snapshotPath)));
+    socket.on("message", (data) => {
+      try {
+        JSON.parse(data.toString("utf8"));
+      } catch (_error) {
+        socket.send(JSON.stringify({
+          type: "error",
+          message: "Invalid client message",
+        }));
+      }
+    });
     socket.on("close", () => {
       liveWsClients.delete(socket);
     });
@@ -320,10 +383,21 @@ async function startDashboardServer(options = {}) {
     });
   });
 
-  const pushTimer = setInterval(async () => {
-    const snapshot = await readSnapshot(snapshotPath);
-    const message = JSON.stringify(snapshot);
-    const sseMessage = `event: state\ndata: ${message}\n\n`;
+  async function pushDelta() {
+    const delta = await readDelta(deltaPath);
+
+    if (!delta) {
+      return;
+    }
+
+    if (Number(delta.sentAtEpochMs || 0) <= lastPushedDeltaEpochMs) {
+      return;
+    }
+
+    lastPushedDeltaEpochMs = Number(delta.sentAtEpochMs || 0);
+
+    const message = JSON.stringify(delta);
+    const sseMessage = `event: delta\ndata: ${message}\n\n`;
 
     for (const client of liveWsClients) {
       if (client.readyState === WebSocket.OPEN) {
@@ -334,6 +408,10 @@ async function startDashboardServer(options = {}) {
     for (const client of sseClients) {
       client.write(sseMessage);
     }
+  }
+
+  const pushTimer = setInterval(() => {
+    pushDelta().catch(() => {});
   }, pushIntervalMs);
 
   await new Promise((resolve, reject) => {
@@ -362,5 +440,6 @@ async function startDashboardServer(options = {}) {
 module.exports = {
   createDashboardRequestHandler,
   startDashboardServer,
+  readDelta,
   readSnapshot,
 };

@@ -82,7 +82,19 @@ h2 {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+  justify-content: flex-end;
+}
+
+.actions button[disabled] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+#emergencyStopButton {
+  border-color: rgba(216, 63, 123, 0.45);
+  color: #9e1f52;
 }
 
 .tabs {

@@ -34,9 +34,12 @@
   const exportDryRunCsvButton = document.getElementById("exportDryRunCsvButton");
   const connectionLine = document.getElementById("connectionLine");
   const detailBody = document.getElementById("detailBody");
-  const startButton = document.getElementById("startButton");
+  const observeButton = document.getElementById("observeButton");
+  const dryRunButton = document.getElementById("dryRunButton");
+  const realGuardedButton = document.getElementById("realGuardedButton");
   const pauseButton = document.getElementById("pauseButton");
   const stopButton = document.getElementById("stopButton");
+  const emergencyStopButton = document.getElementById("emergencyStopButton");
   const unpinButton = document.getElementById("unpinButton");
   const feeInput = document.getElementById("feeInput");
   const staleInput = document.getElementById("staleInput");
@@ -69,6 +72,10 @@
   let renderDurationSamples = [];
   let cachedLogRows = [];
   let lastFrameReportAt = performance.now();
+  let lastChartRenderAt = 0;
+  let deferredRestyleTimer = null;
+  let pendingCommandId = null;
+  let pendingCommandTimer = null;
   const enabledGroups = new Set(["KRW_START", "BTC_START", "USDT_START"]);
 
   function parseNumber(value, fallback) {
@@ -164,6 +171,43 @@
 
   function runtimeConfig() {
     return (latestState && latestState.runtimeConfig) || {};
+  }
+
+  function engineState() {
+    return latestState && (latestState.engineState || (latestState.engine && latestState.engine.state)) || "UNKNOWN";
+  }
+
+  function realRunReady() {
+    const config = runtimeConfig();
+    return Boolean(
+      config.liveTradingEnabled &&
+      latestState &&
+      latestState.readiness &&
+      latestState.readiness.passed &&
+      latestState.privateWsStatus &&
+      latestState.privateWsStatus.status === "open" &&
+      latestState.privateCacheStatus &&
+      latestState.privateCacheStatus.orderChanceFresh &&
+      latestState.privateCacheStatus.accountBalanceFresh,
+    );
+  }
+
+  function updateCommandButtons() {
+    const state = engineState();
+    const running = state === "RUNNING";
+    const paused = state === "PAUSED";
+    const stopped = state === "STOPPED";
+    const pending = Boolean(pendingCommandId);
+
+    observeButton.disabled = pending || !stopped;
+    dryRunButton.disabled = pending || !stopped;
+    realGuardedButton.disabled = pending || !stopped || !realRunReady();
+    realGuardedButton.title = realGuardedButton.disabled && !realRunReady()
+      ? "Real Guarded requires live trading, readiness PASS, private WS, and fresh private caches."
+      : "";
+    pauseButton.disabled = pending || !running;
+    stopButton.disabled = pending || !(running || paused);
+    emergencyStopButton.disabled = pending || !(running || paused || state === "ERROR");
   }
 
   function renderConfigTable(config) {
@@ -544,6 +588,7 @@
     connectionLine.textContent =
       `Last update ${formatTime(latestState.summary.lastUpdateTime)} | ` +
       `Calculated ${formatTime(latestState.lastCalculatedAt)}`;
+    updateCommandButtons();
   }
 
   function updatePerformanceCards() {
@@ -802,6 +847,7 @@
       chartInitialized = true;
       recordRenderDuration(performance.now() - started);
       renderedFrames += 1;
+      lastChartRenderAt = performance.now();
       clampCurrentXRange();
     });
   }
@@ -1123,6 +1169,7 @@
       chartRows = visibleDecoratedRows();
       rebuildPointIndex();
       renderedFrames += 1;
+      lastChartRenderAt = performance.now();
       updateSummary(chartRows);
       updatePerformanceCards();
       clampCurrentXRange();
@@ -1136,6 +1183,15 @@
 
   function scheduleRestyle() {
     if (pendingFrame) return;
+    const now = performance.now();
+    const minRenderGapMs = 100;
+
+    if (now - lastChartRenderAt < minRenderGapMs) {
+      clearTimeout(deferredRestyleTimer);
+      deferredRestyleTimer = setTimeout(scheduleRestyle, minRenderGapMs - (now - lastChartRenderAt));
+      return;
+    }
+
     pendingFrame = true;
     requestAnimationFrame(restyleChart);
   }
@@ -1143,6 +1199,15 @@
   function applyDelta(delta) {
     if (!latestState) return;
     const clientReceivedEpochMs = Date.now();
+    if (delta.stateDelta) {
+      latestState = {
+        ...latestState,
+        ...delta.stateDelta,
+      };
+    }
+    if (delta.lastCalculatedAt) {
+      latestState.lastCalculatedAt = delta.lastCalculatedAt;
+    }
     if (delta.summaryDelta) {
       latestState.summary = {
         ...latestState.summary,
@@ -1159,11 +1224,12 @@
 
     if (pendingChangedCycleIds.size > 0) {
       scheduleRestyle();
-    } else if (delta.metrics) {
+    } else if (delta.metrics || delta.stateDelta || delta.summaryDelta) {
       chartRows = visibleDecoratedRows();
       rebuildPointIndex();
       updateSummary(chartRows);
       updatePerformanceCards();
+      updateCommandButtons();
     }
   }
 
@@ -1175,6 +1241,10 @@
 
     events.addEventListener("state", (event) => {
       applyState(JSON.parse(event.data));
+    });
+
+    events.addEventListener("delta", (event) => {
+      applyDelta(JSON.parse(event.data));
     });
 
     events.addEventListener("status", (event) => {
@@ -1263,11 +1333,49 @@
     applyState(await response.json());
   }
 
-  async function sendEngineCommand(command) {
+  function clearPendingCommand() {
+    pendingCommandId = null;
+    clearTimeout(pendingCommandTimer);
+    pendingCommandTimer = null;
+    updateCommandButtons();
+  }
+
+  async function pollCommandStatus(commandId, attempt = 0) {
+    const response = await fetch(`/api/commands/${encodeURIComponent(commandId)}`);
+    const payload = response.ok ? await response.json() : null;
+    const status = payload && payload.status;
+
+    if (status && status.status === "accepted") {
+      showToast(`${status.command} accepted (${status.runMode || "current"})`);
+      clearPendingCommand();
+      return;
+    }
+
+    if (status && status.status === "rejected") {
+      showToast(`${status.command} rejected: ${status.message || "unknown reason"}`);
+      clearPendingCommand();
+      return;
+    }
+
+    if (attempt >= 30) {
+      showToast("Command is still queued. Check engine process.");
+      clearPendingCommand();
+      return;
+    }
+
+    pendingCommandTimer = setTimeout(() => {
+      pollCommandStatus(commandId, attempt + 1).catch((error) => {
+        showToast(error.message);
+        clearPendingCommand();
+      });
+    }, 500);
+  }
+
+  async function sendEngineCommand(command, options = {}) {
     const response = await fetch("/api/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command }),
+      body: JSON.stringify({ command, ...options }),
     });
     const result = await response.json();
 
@@ -1275,7 +1383,13 @@
       throw new Error(result.error || `Command failed: ${command}`);
     }
 
-    showToast(`${result.command} command queued`);
+    pendingCommandId = result.commandId;
+    updateCommandButtons();
+    showToast(`${result.command} queued${result.runMode ? ` (${result.runMode})` : ""}`);
+    pollCommandStatus(result.commandId).catch((error) => {
+      showToast(error.message);
+      clearPendingCommand();
+    });
   }
 
   function activateTab(tabName) {
@@ -1383,9 +1497,12 @@
     });
     autoScaleInput.addEventListener("change", renderChart);
     showUnavailableInput.addEventListener("change", renderChart);
-    startButton.addEventListener("click", () => sendEngineCommand("Start").catch((error) => showToast(error.message)));
+    observeButton.addEventListener("click", () => sendEngineCommand("Start", { runMode: "OBSERVE" }).catch((error) => showToast(error.message)));
+    dryRunButton.addEventListener("click", () => sendEngineCommand("Start", { runMode: "DRY_RUN" }).catch((error) => showToast(error.message)));
+    realGuardedButton.addEventListener("click", () => sendEngineCommand("Start", { runMode: "REAL_GUARDED" }).catch((error) => showToast(error.message)));
     pauseButton.addEventListener("click", () => sendEngineCommand("Pause").catch((error) => showToast(error.message)));
     stopButton.addEventListener("click", () => sendEngineCommand("Stop").catch((error) => showToast(error.message)));
+    emergencyStopButton.addEventListener("click", () => sendEngineCommand("Stop", { emergency: true }).catch((error) => showToast(error.message)));
     refreshLogsButton.addEventListener("click", () => refreshLogs().catch((error) => showToast(error.message)));
     exportDryRunJsonButton.addEventListener("click", () => exportDryRun("json").catch((error) => showToast(error.message)));
     exportDryRunCsvButton.addEventListener("click", () => exportDryRun("csv").catch((error) => showToast(error.message)));
