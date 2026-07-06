@@ -30,9 +30,9 @@ const COMMANDS = [
   ["/emergency-stop", "Queue Stop with emergency=true"],
   ["/readiness", "Show real-run readiness checklist"],
   ["/mode", "Show current run mode"],
-  ["/market", "Show market feed/cache status"],
+  ["/market", "Show market feed/cache status; subcommands: feeds, fees, stale, latency, exchanges"],
   ["/strategy list|active|explain|select", "Inspect or select configured strategy"],
-  ["/system", "Show runtime files and latency budget"],
+  ["/system", "Show system status; subcommands: perf, latency, guards, files"],
   ["/latency", "Show latency/performance budget"],
   ["/execution", "Show execution balances, orders, fills, and guards"],
   ["/balances", "Show dry-run and real balance snapshots"],
@@ -199,6 +199,19 @@ function renderMarket(snapshot = {}, section = "") {
     return renderLatency(snapshot);
   }
 
+  if (section === "exchanges") {
+    const exchange = runtimeConfig(snapshot).exchange || "upbit";
+    return [
+      "Market Exchanges",
+      renderTable(["Exchange", "Status", "Role"], [
+        [exchange, "enabled", "configured runtime exchange"],
+        ["binance", "not_implemented", "-"],
+        ["bithumb", "not_implemented", "-"],
+        ["bybit", "not_implemented", "-"],
+      ]),
+    ].join("\n");
+  }
+
   return [
     "Market",
     renderKeyValues([
@@ -217,9 +230,64 @@ function renderMarket(snapshot = {}, section = "") {
   ].join("\n");
 }
 
-function renderSystem(snapshot = {}) {
+function renderSystem(snapshot = {}, section = "") {
   const budget = snapshot.performanceBudget || {};
   const processInfo = snapshot.engineProcess || {};
+  const metrics = sanitizeLegacyBrowserMetrics(snapshot.metrics || {});
+  const guard = snapshot.guardStatus || {};
+
+  if (section === "perf") {
+    return [
+      "System Performance",
+      renderKeyValues([
+        ["CPU", metrics.cpu && metrics.cpu.processCpuPercent],
+        ["Memory RSS", metrics.memory && metrics.memory.rss],
+        ["Heap used", metrics.memory && metrics.memory.heapUsed],
+        ["Event loop utilization", metrics.eventLoop && metrics.eventLoop.utilization],
+        ["Event loop p95 ms", metrics.eventLoop && metrics.eventLoop.delay && metrics.eventLoop.delay.p95Ms],
+      ]),
+      metrics.rates ? renderTable(
+        ["Rate", "Per second"],
+        Object.entries(metrics.rates).map(([name, value]) => [name, value]),
+      ) : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  if (section === "latency") {
+    return renderLatency(snapshot);
+  }
+
+  if (section === "guards") {
+    return [
+      "System Guards",
+      renderKeyValues([
+        ["Healthy", guard.healthy === true],
+        ["Emergency stop", snapshot.emergencyStop && snapshot.emergencyStop.active === true],
+        ["Consecutive failures", guard.consecutiveFailures ?? "-"],
+        ["Max consecutive failures", guard.maxConsecutiveFailures ?? "-"],
+        ["Open orders", guard.openOrderCount ?? "-"],
+        ["Max open orders", guard.maxOpenOrders ?? "-"],
+        ["Active real executions", guard.activeRealExecutionCount ?? "-"],
+        ["Readiness passed", snapshot.readiness && snapshot.readiness.passed === true],
+      ]),
+    ].join("\n");
+  }
+
+  if (section === "files") {
+    const runtimeDir = processInfo.runtimeDir || path.resolve(process.cwd(), "out", "runtime");
+    return [
+      "System Files",
+      renderKeyValues([
+        ["Runtime dir", runtimeDir],
+        ["Snapshot", processInfo.snapshotPath || path.join(runtimeDir, "latest-snapshot.json")],
+        ["Delta", processInfo.deltaPath || path.join(runtimeDir, "latest-delta.json")],
+        ["Command inbox", path.join(runtimeDir, "commands", "inbox")],
+        ["Command processed", path.join(runtimeDir, "commands", "processed")],
+        ["Command status", path.join(runtimeDir, "command-status")],
+        ["Logs", path.resolve(process.cwd(), "out", "logs")],
+      ]),
+    ].join("\n");
+  }
 
   return [
     "System",
@@ -981,7 +1049,7 @@ async function runOnce(parsed, context) {
     }
     if (parsed.name === "readiness") return { exit: false, output: renderReadiness(snapshot) };
     if (parsed.name === "market") return { exit: false, output: renderMarket(snapshot, parsed.args[0] || "") };
-    if (parsed.name === "system") return { exit: false, output: renderSystem(snapshot) };
+    if (parsed.name === "system") return { exit: false, output: renderSystem(snapshot, parsed.args[0] || "") };
     if (parsed.name === "latency") return { exit: false, output: renderLatency(snapshot) };
     if (parsed.name === "execution") return { exit: false, output: renderExecution(snapshot, parsed.args[0] || "") };
     if (parsed.name === "balances") return { exit: false, output: renderBalances(snapshot) };

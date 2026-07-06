@@ -1214,6 +1214,7 @@ class EngineRuntime {
         pid: process.pid,
         runtimeDir: this.runtimeDir,
         snapshotPath: this.snapshotPath,
+        deltaPath: this.deltaPath,
       },
       privateWsStatus: this.privateWsStatus,
       readiness: this.readiness,

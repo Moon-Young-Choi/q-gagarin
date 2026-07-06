@@ -315,3 +315,65 @@ test("CLI market and execution subcommands render focused views", async () => {
   assert.match(residuals.output, /BTC/);
   assert.match(residuals.output, /partial/);
 });
+
+test("CLI system subcommands and exchange view render without browser services", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-cli-system-"));
+  const snapshotPath = path.join(dir, "latest-snapshot.json");
+  await fs.writeFile(snapshotPath, JSON.stringify({
+    engineState: "RUNNING",
+    runtimeConfig: {
+      runMode: "DRY_RUN",
+      exchange: "upbit",
+    },
+    engineProcess: {
+      pid: 123,
+      runtimeDir: path.join(dir, "runtime"),
+      snapshotPath,
+      deltaPath: path.join(dir, "latest-delta.json"),
+    },
+    metrics: {
+      cpu: { processCpuPercent: 1.2 },
+      memory: { rss: 1000, heapUsed: 500 },
+      eventLoop: { utilization: 0.1, delay: { p95Ms: 2 } },
+      rates: { recalculatedCyclesPerSec: 3 },
+    },
+    guardStatus: {
+      healthy: true,
+      consecutiveFailures: 0,
+      maxConsecutiveFailures: 3,
+      openOrderCount: 0,
+      maxOpenOrders: 2,
+      activeRealExecutionCount: 0,
+    },
+    readiness: {
+      passed: true,
+    },
+    performanceBudget: {
+      marketData: {},
+      decision: {},
+      execution: {},
+      displayLatencyAffectsTrading: false,
+    },
+  }));
+  const context = createCliContext({
+    runtimeDir: dir,
+    logDir: path.join(dir, "logs"),
+    snapshotPath,
+    output: memoryOutput(),
+  });
+
+  const exchanges = await runOnce(parseSlashCommand("/market exchanges"), context);
+  const perf = await runOnce(parseSlashCommand("/system perf"), context);
+  const guards = await runOnce(parseSlashCommand("/system guards"), context);
+  const files = await runOnce(parseSlashCommand("/system files"), context);
+  const latency = await runOnce(parseSlashCommand("/system latency"), context);
+
+  assert.match(exchanges.output, /upbit\s+enabled/);
+  assert.match(perf.output, /System Performance/);
+  assert.match(perf.output, /recalculatedCyclesPerSec/);
+  assert.match(guards.output, /System Guards/);
+  assert.match(guards.output, /Healthy\s+yes/);
+  assert.match(files.output, /System Files/);
+  assert.match(files.output, /Command inbox/);
+  assert.match(latency.output, /display\s+affectsTrading\s+no/);
+});
