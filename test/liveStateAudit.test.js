@@ -114,8 +114,16 @@ function stateWithCycle(options = {}) {
   });
   state.cycles = [cycle];
   state.cycleIndex = new Map([[cycle.cycleId, cycle]]);
+  state.marketToCycleIds = state.buildMarketToCycleIds();
 
   return { state, logStore, cycle };
+}
+
+function installOrderbooks(state, books = orderbooks()) {
+  for (const book of books.values()) {
+    state.observationStore.update(book, book.receivedAt || Date.now());
+    state.validationStore.update(book, book.receivedAt || Date.now());
+  }
 }
 
 test("live state degrades instead of throwing when Upbit market discovery fails", async () => {
@@ -222,6 +230,85 @@ test("live scanner logs candidate strategy and execution plan audit events", asy
   assert.equal(planEvent.strategyId, "depthAwareLimitIoc");
   assert.equal(planEvent.validationStatus, "accepted");
   assert.equal(planEvent.excludeFromDryRunSummary, true);
+});
+
+test("live scheduler coalesces duplicate dirty cycles and respects batch limits", async () => {
+  const { state, cycle } = stateWithCycle({
+    runtimeConfig: {
+      activeStrategyId: "topOfBookBaseline",
+    },
+  });
+  const secondCycle = {
+    ...cycle,
+    cycleId: "KRW|BTC|ETH:reverse:KRW",
+    routeVariantId: "KRW|BTC|ETH:reverse:KRW",
+    direction: "reverse",
+  };
+  state.cycles = [cycle, secondCycle];
+  state.cycleIndex = new Map(state.cycles.map((item) => [item.cycleId, item]));
+  state.cycleRows = new Map(state.cycles.map((item) => [item.cycleId, {
+    cycleId: item.cycleId,
+    status: "warming",
+    validationStatus: "pending",
+  }]));
+  installOrderbooks(state);
+
+  state.queueCycleRecalculation([cycle.cycleId, cycle.cycleId, secondCycle.cycleId], {
+    reason: "test",
+  });
+  state.stopScheduler();
+  assert.equal(state.pendingCycleIds.size, 2);
+
+  const first = await state.processPendingCycles({ maxCycles: 1, maxTickMs: 1000 });
+  assert.equal(first.processed, 1);
+  assert.equal(first.remaining, 1);
+  assert.equal(state.pendingCycleIds.size, 1);
+
+  const second = await state.processPendingCycles({ maxCycles: 10, maxTickMs: 1000 });
+  assert.equal(second.processed, 1);
+  assert.equal(second.remaining, 0);
+  assert.equal(state.getSchedulerStatus().completedCycleCount, 2);
+});
+
+test("bounded warm-up suppresses detailed rejected decision logs and emits summary", async () => {
+  const { state, logStore, cycle } = stateWithCycle();
+  installOrderbooks(state, orderbooks({ thinFirstLeg: true }));
+
+  state.queueCycleRecalculation([cycle.cycleId], {
+    reason: "warm-up",
+    warmup: true,
+  });
+  state.stopScheduler();
+  await state.processPendingCycles({ maxCycles: 10, maxTickMs: 1000 });
+
+  const eventTypes = logStore.records.events.map((event) => event.type);
+  assert.equal(eventTypes.includes("candidate.detected"), false);
+  assert.equal(eventTypes.includes("candidate.validated"), false);
+  assert.equal(eventTypes.includes("strategy.rejected"), false);
+  assert.equal(logStore.records.decisions.length, 0);
+  assert.equal(eventTypes.includes("strategy-decision-summary"), true);
+  assert.equal(logStore.records.events.find((event) => event.type === "strategy-decision-summary").rejectedCount, 1);
+});
+
+test("live snapshot exposes compact cycle rows and scheduler progress", async () => {
+  const { state, cycle } = stateWithCycle();
+  installOrderbooks(state);
+  await state.processPendingCycles({ maxCycles: 10, maxTickMs: 1000 });
+  state.recalculateCycle(cycle.cycleId, {
+    nowMs: 1000,
+    calculationOrderbooks: orderbooks(),
+    validationOrderbooks: orderbooks(),
+    logDecision: false,
+  });
+
+  const snapshot = state.getSnapshot(new Date("2026-07-06T00:00:00.000Z"));
+
+  assert.equal(snapshot.cycles.length, 1);
+  assert.equal(snapshot.summary.cycleScheduler.totalCycleCount, 1);
+  assert.equal(snapshot.summary.cycleScheduler.completedCycleCount, 1);
+  assert.equal(snapshot.cycles[0].cycleId, cycle.cycleId);
+  assert.equal(Object.hasOwn(snapshot.cycles[0], "validationOrderbookMetadata"), false);
+  assert.equal(Object.hasOwn(snapshot.cycles[0], "history"), false);
 });
 
 test("live scanner applies market and side fee policies to depth validation and plans", async () => {
@@ -359,9 +446,29 @@ test("live state records replayable market orderbook update audit events", () =>
   assert.equal(observation.traceId, "observation:KRW-BTC:1000:1");
   assert.equal(observation.exchangeTimestampMs, 1000);
   assert.equal(observation.serverReceivedAtMs, 1000);
-  assert.equal(observation.orderbook_units.length, 2);
+  assert.equal(observation.orderbook_units.length, 1);
   assert.equal(observation.payload.orderbookUnitCount, 2);
+  assert.equal(observation.payload.loggedOrderbookUnitCount, 1);
+  assert.equal(observation.payload.marketLogMode, "compact");
   assert.equal(observation.excludeFromDryRunSummary, true);
   assert.equal(validation.unit, 30);
   assert.equal(validation.traceId, "validation:KRW-BTC:1000:1");
+});
+
+test("live state samples repeated market orderbook audit logs per feed and market", () => {
+  const { state, logStore } = stateWithCycle();
+
+  state.updateObservationOrderbook(orderbook("KRW-BTC", [
+    { ask_price: 100, bid_price: 99, ask_size: 1, bid_size: 2 },
+  ], { receivedAt: 1000, timestamp: 1000 }));
+  state.updateObservationOrderbook(orderbook("KRW-BTC", [
+    { ask_price: 101, bid_price: 98, ask_size: 1, bid_size: 2 },
+  ], { receivedAt: 1001, timestamp: 1001 }));
+  state.updateObservationOrderbook(orderbook("KRW-BTC", [
+    { ask_price: 102, bid_price: 97, ask_size: 1, bid_size: 2 },
+  ], { receivedAt: 7000, timestamp: 7000 }));
+
+  assert.equal(logStore.records.market.length, 2);
+  assert.equal(state.pendingDirtyMarkets.size, 1);
+  assert.equal(state.pendingCycleIds.has("KRW|BTC|ETH:canonical:KRW"), true);
 });

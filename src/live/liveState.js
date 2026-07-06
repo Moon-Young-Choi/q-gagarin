@@ -72,12 +72,15 @@ function toCalculationOrderbook(topOfBook) {
   };
 }
 
-function orderbookAuditPayload(feedName, orderbook) {
+function orderbookAuditPayload(feedName, orderbook, options = {}) {
   if (!orderbook) return null;
 
-  const units = Array.isArray(orderbook.orderbook_units)
+  const allUnits = Array.isArray(orderbook.orderbook_units)
     ? orderbook.orderbook_units
     : orderbook.orderbookUnits || [];
+  const logMode = options.marketLogMode || "compact";
+  const unitLimit = Math.max(1, Number.parseInt(options.marketLogUnitLimit || "1", 10));
+  const units = logMode === "full" ? allUnits : allUnits.slice(0, unitLimit);
 
   return {
     type: "market.orderbook_update",
@@ -86,7 +89,7 @@ function orderbookAuditPayload(feedName, orderbook) {
     feedName,
     market: orderbook.market,
     unit: orderbook.unit || orderbook.orderbookUnit || units.length,
-    orderbookUnit: orderbook.orderbookUnit || orderbook.unit || units.length,
+    orderbookUnit: orderbook.orderbookUnit || orderbook.unit || allUnits.length,
     orderbookLevel: orderbook.orderbookLevel ?? null,
     streamType: orderbook.streamType,
     traceId: orderbook.traceId,
@@ -104,7 +107,7 @@ function orderbookAuditPayload(feedName, orderbook) {
     payload: {
       feedName,
       market: orderbook.market,
-      unit: orderbook.unit || orderbook.orderbookUnit || units.length,
+      unit: orderbook.unit || orderbook.orderbookUnit || allUnits.length,
       traceId: orderbook.traceId,
       localSequence: orderbook.localSequence,
       exchangeTimestampMs: orderbook.exchangeTimestampMs,
@@ -112,7 +115,9 @@ function orderbookAuditPayload(feedName, orderbook) {
       orderbookLevel: orderbook.orderbookLevel ?? null,
       bestAskPrice: orderbook.askPrice,
       bestBidPrice: orderbook.bidPrice,
-      orderbookUnitCount: units.length,
+      orderbookUnitCount: allUnits.length,
+      loggedOrderbookUnitCount: units.length,
+      marketLogMode: logMode,
     },
   };
 }
@@ -213,6 +218,101 @@ function compactCycleForDelta(row) {
   };
 }
 
+function compactCycleForSnapshot(row) {
+  if (!row) return null;
+
+  return {
+    ...compactCycleForDelta(row),
+    group: row.group,
+    groupLabel: row.groupLabel,
+    groupIndex: row.groupIndex,
+    route: row.route,
+    routeLabel: row.routeLabel,
+    markets: row.markets,
+    legs: row.legs,
+    assets: row.assets,
+    newestLegAgeMs: row.newestLegAgeMs,
+    oldestLegAgeMs: row.oldestLegAgeMs,
+    maxLegAgeMs: row.maxLegAgeMs,
+    lastOrderbookTimestamp: row.lastOrderbookTimestamp,
+    oldestOrderbookReceivedAt: row.oldestOrderbookReceivedAt,
+  };
+}
+
+function pendingCycleRow(cycle, reason = "WARMING_UP") {
+  return {
+    triangleId: cycle.triangleId,
+    cycleId: cycle.cycleId,
+    legacyCycleId: cycle.legacyCycleId,
+    routeVariantId: cycle.routeVariantId,
+    startAsset: cycle.startAsset,
+    endAsset: cycle.endAsset,
+    direction: cycle.direction,
+    directionLabel: cycle.directionLabel,
+    group: cycle.group,
+    groupLabel: cycle.groupLabel,
+    groupIndex: cycle.groupIndex,
+    x: cycle.x,
+    y: null,
+    markerSymbol: cycle.markerSymbol,
+    markerColor: "#aeb8c5",
+    route: cycle.route,
+    routeLabel: cycle.routeLabel,
+    markets: cycle.markets,
+    legs: cycle.steps,
+    status: "warming",
+    unavailableReason: reason,
+    validationStatus: "pending",
+    validationReason: reason,
+    strategyId: null,
+    strategyVersion: null,
+    strategyAccepted: null,
+    strategyReason: reason,
+    executionFeasibility: reason,
+    calculatedAtEpochMs: null,
+    calculatedAtIso: null,
+  };
+}
+
+function rowsDifferForLogging(previous = {}, next = {}) {
+  if (!previous || previous.status === "warming") return true;
+
+  return previous.status !== next.status ||
+    previous.staleReason !== next.staleReason ||
+    previous.unavailableReason !== next.unavailableReason ||
+    previous.validationStatus !== next.validationStatus ||
+    previous.validationReason !== next.validationReason ||
+    previous.strategyAccepted !== next.strategyAccepted ||
+    previous.strategyReason !== next.strategyReason ||
+    previous.executionFeasibility !== next.executionFeasibility ||
+    previous.opportunityClass !== next.opportunityClass;
+}
+
+function schedulerConfig(options = {}) {
+  return {
+    maxCyclesPerTick: Number.parseInt(
+      options.maxCyclesPerTick || process.env.Q_GAGARIN_MAX_CYCLES_PER_TICK || "200",
+      10,
+    ),
+    maxTickMs: Number.parseInt(
+      options.maxTickMs || process.env.Q_GAGARIN_MAX_SCHEDULER_MS || "25",
+      10,
+    ),
+    intervalMs: Number.parseInt(
+      options.intervalMs || process.env.Q_GAGARIN_SCHEDULER_INTERVAL_MS || "25",
+      10,
+    ),
+    summaryLogIntervalMs: Number.parseInt(
+      options.summaryLogIntervalMs || process.env.Q_GAGARIN_DECISION_SUMMARY_INTERVAL_MS || "5000",
+      10,
+    ),
+    fullAgingSweepMs: Number.parseInt(
+      options.fullAgingSweepMs || process.env.Q_GAGARIN_FULL_AGING_SWEEP_MS || "60000",
+      10,
+    ),
+  };
+}
+
 class LiveTriangleState {
   constructor(options = {}) {
     this.feeRate = parseFeeRate(options.feeRate, 0);
@@ -274,6 +374,35 @@ class LiveTriangleState {
     this.lastFallbackPollAt = null;
     this.lastFallbackPollError = null;
     this.initializationError = null;
+    this.pendingCycleIds = new Set();
+    this.pendingCycleMetadata = new Map();
+    this.pendingDirtyMarkets = new Map();
+    this.schedulerTimer = null;
+    this.schedulerRunning = false;
+    this.scheduler = schedulerConfig(options.scheduler || {});
+    this.schedulerStats = {
+      queuedCycleCount: 0,
+      processedCycleCount: 0,
+      lastProcessedAt: null,
+      lastTickProcessed: 0,
+      lastTickDurationMs: 0,
+      warmupCompleteAt: null,
+      pendingReasonCounts: {},
+      lastDirtyMarketCount: 0,
+    };
+    this.lastFullAgingQueueAt = 0;
+    this.decisionSummary = this.emptyDecisionSummary();
+    this.lastDecisionSummaryLoggedAt = 0;
+    this.marketLogMode = options.marketLogMode || process.env.Q_GAGARIN_MARKET_LOG_MODE || "compact";
+    this.marketLogUnitLimit = Math.max(1, Number.parseInt(
+      options.marketLogUnitLimit || process.env.Q_GAGARIN_MARKET_LOG_UNIT_LIMIT || "1",
+      10,
+    ));
+    this.marketLogIntervalMs = Math.max(0, Number.parseInt(
+      options.marketLogIntervalMs || process.env.Q_GAGARIN_MARKET_LOG_INTERVAL_MS || "5000",
+      10,
+    ));
+    this.lastMarketLogAtByKey = new Map();
   }
 
   setRuntimeConfig(runtimeConfig) {
@@ -314,8 +443,12 @@ class LiveTriangleState {
       this.hubBreakdown = getHubBreakdownCounts(triangles);
       this.requiredMarkets = [...new Set(this.cycles.flatMap((cycle) => cycle.markets))].sort();
       this.marketToCycleIds = this.buildMarketToCycleIds();
+      this.cycleRows = new Map(this.cycles.map((cycle) => [cycle.cycleId, pendingCycleRow(cycle)]));
+      this.pendingCycleIds.clear();
+      this.pendingCycleMetadata.clear();
+      this.pendingDirtyMarkets.clear();
+      this.schedulerStats.warmupCompleteAt = null;
       this.initializationError = null;
-      this.recalculateAll({ markDirty: false });
       return {
         ok: true,
         marketsLoaded: this.marketRows.length,
@@ -336,6 +469,9 @@ class LiveTriangleState {
       this.xRange = { min: 0.25, max: 1.75 };
       this.hubBreakdown = {};
       this.requiredMarkets = [];
+      this.pendingCycleIds.clear();
+      this.pendingCycleMetadata.clear();
+      this.pendingDirtyMarkets.clear();
       this.initializationError = {
         source: "upbit-market-discovery",
         message,
@@ -394,7 +530,12 @@ class LiveTriangleState {
 
     this.lastFallbackPollAt = new Date(receivedAt).toISOString();
     this.lastFallbackPollError = result.errors.length > 0 ? result.errors : null;
-    this.recalculateAll({ markDirty: options.markDirty !== false, lastChangedMarket: null });
+    this.queueCycleRecalculation(this.cycles.map((cycle) => cycle.cycleId), {
+      reason: "warm-up",
+      warmup: true,
+      markDirty: options.markDirty !== false,
+      lastChangedMarket: null,
+    });
     return result;
   }
 
@@ -463,7 +604,8 @@ class LiveTriangleState {
       affectedCycleLookupDonePerfNs,
     };
 
-    this.recalculateCycles(affectedCycleIds, {
+    this.queueMarketRecalculation("observation", normalized, affectedCycleIds, {
+      reason: "observation",
       markDirty: true,
       lastChangedMarket: normalized.market,
       lastUpbitTimestampMs: Number(normalized.timestamp),
@@ -486,7 +628,8 @@ class LiveTriangleState {
     this.appendMarketOrderbookUpdate("validation", normalized);
 
     const affectedCycleIds = [...(this.marketToCycleIds.get(normalized.market) || [])];
-    this.recalculateCycles(affectedCycleIds, {
+    this.queueMarketRecalculation("validation", normalized, affectedCycleIds, {
+      reason: "validation",
       markDirty: true,
       lastChangedMarket: normalized.market,
       lastUpbitTimestampMs: Number(normalized.timestamp),
@@ -552,7 +695,10 @@ class LiveTriangleState {
 
   setFeeRate(value) {
     this.feeRate = parseFeeRate(value, this.feeRate);
-    this.recalculateAll({ markDirty: true });
+    this.queueCycleRecalculation(this.cycles.map((cycle) => cycle.cycleId), {
+      reason: "fee-rate-changed",
+      markDirty: true,
+    });
   }
 
   selectStrategy(strategyId) {
@@ -570,7 +716,79 @@ class LiveTriangleState {
       requestedStrategyId: strategyId,
       reason: "selected while STOPPED",
     });
-    this.recalculateAll({ markDirty: true });
+    this.queueCycleRecalculation(this.cycles.map((cycle) => cycle.cycleId), {
+      reason: "strategy-selection",
+      markDirty: true,
+    });
+  }
+
+  emptyDecisionSummary() {
+    return {
+      type: "strategy-decision-summary",
+      mode: executionLogMode(this.runtimeConfig && this.runtimeConfig.runMode),
+      exchange: "upbit",
+      engineState: this.engineState,
+      runtimeRunMode: this.runtimeConfig && this.runtimeConfig.runMode,
+      opportunityCount: 0,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      stateChangeCount: 0,
+      byReason: {},
+      byStartAsset: {},
+      byStrategy: {},
+      firstAt: null,
+      lastAt: null,
+    };
+  }
+
+  recordDecisionSummary(row, options = {}) {
+    const nowIso = row.calculatedAtIso || new Date().toISOString();
+    const reason = row.strategyReason || row.validationReason || row.unavailableReason || row.staleReason || "UNKNOWN";
+    const startAsset = row.startAsset || "UNKNOWN";
+    const strategyId = row.strategyId || "UNKNOWN";
+
+    if (this.decisionSummary.opportunityCount === 0) {
+      this.decisionSummary.firstAt = nowIso;
+    }
+
+    this.decisionSummary.mode = executionLogMode(this.runtimeConfig.runMode);
+    this.decisionSummary.engineState = this.engineState;
+    this.decisionSummary.runtimeRunMode = this.runtimeConfig.runMode;
+    this.decisionSummary.opportunityCount += 1;
+    this.decisionSummary.lastAt = nowIso;
+    if (row.strategyAccepted === true) {
+      this.decisionSummary.acceptedCount += 1;
+    } else if (row.strategyAccepted === false) {
+      this.decisionSummary.rejectedCount += 1;
+    }
+    if (options.stateChanged) {
+      this.decisionSummary.stateChangeCount += 1;
+    }
+    this.decisionSummary.byReason[reason] = (this.decisionSummary.byReason[reason] || 0) + 1;
+    this.decisionSummary.byStartAsset[startAsset] = (this.decisionSummary.byStartAsset[startAsset] || 0) + 1;
+    this.decisionSummary.byStrategy[strategyId] = (this.decisionSummary.byStrategy[strategyId] || 0) + 1;
+  }
+
+  flushDecisionSummary(nowMs = Date.now(), options = {}) {
+    if (!this.logStore || this.decisionSummary.opportunityCount === 0) {
+      return null;
+    }
+
+    const interval = Math.max(1000, this.scheduler.summaryLogIntervalMs);
+    if (!options.force && nowMs - this.lastDecisionSummaryLoggedAt < interval) {
+      return null;
+    }
+
+    const summary = {
+      ...this.decisionSummary,
+      generatedAt: new Date(nowMs).toISOString(),
+      excludeFromDryRunSummary: true,
+    };
+
+    this.logStore.append("events", summary).catch(() => {});
+    this.lastDecisionSummaryLoggedAt = nowMs;
+    this.decisionSummary = this.emptyDecisionSummary();
+    return summary;
   }
 
   logEvent(type, payload = {}) {
@@ -613,7 +831,11 @@ class LiveTriangleState {
 
   appendMarketOrderbookUpdate(feedName, orderbook) {
     if (!this.logStore) return null;
-    const auditPayload = orderbookAuditPayload(feedName, orderbook);
+    if (!this.shouldAppendMarketOrderbookUpdate(feedName, orderbook)) return null;
+    const auditPayload = orderbookAuditPayload(feedName, orderbook, {
+      marketLogMode: this.marketLogMode,
+      marketLogUnitLimit: this.marketLogUnitLimit,
+    });
 
     if (!auditPayload) return null;
 
@@ -628,7 +850,23 @@ class LiveTriangleState {
     return event;
   }
 
-  logDecision(row) {
+  shouldAppendMarketOrderbookUpdate(feedName, orderbook) {
+    if (!orderbook || !orderbook.market) return false;
+    if (this.marketLogIntervalMs <= 0) return true;
+
+    const key = `${feedName}:${orderbook.market}`;
+    const nowMs = Number(orderbook.serverReceivedAtMs || orderbook.receivedAt || Date.now());
+    const previousMs = this.lastMarketLogAtByKey.get(key);
+
+    if (previousMs !== undefined && nowMs - previousMs < this.marketLogIntervalMs) {
+      return false;
+    }
+
+    this.lastMarketLogAtByKey.set(key, nowMs);
+    return true;
+  }
+
+  logDecision(row, options = {}) {
     const mode = executionLogMode(this.runtimeConfig.runMode);
     const expectedNetProfit = row.executableStartAmount === null || row.executableStartAmount === undefined ||
       row.netProfitRate === null || row.netProfitRate === undefined
@@ -645,6 +883,14 @@ class LiveTriangleState {
       strategyId: row.strategyId,
       strategyVersion: row.strategyVersion,
     };
+
+    const logDetailed = options.detailed !== false;
+
+    if (!logDetailed) {
+      this.recordDecisionSummary(row, { stateChanged: options.stateChanged });
+      this.flushDecisionSummary(row.calculatedAtEpochMs || Date.now());
+      return;
+    }
 
     this.logEvent("strategy-decision", {
       mode,
@@ -1011,6 +1257,9 @@ class LiveTriangleState {
     row.timingTrace = timingTrace.serialize();
     row.timingBreakdown = timingTrace.breakdown();
 
+    const previousRow = this.cycleRows.get(cycle.cycleId);
+    const stateChanged = rowsDifferForLogging(previousRow, row);
+
     this.appendHistory(row);
     this.cycleRows.set(cycle.cycleId, row);
     this.metrics.increment("recalculatedCycles");
@@ -1024,11 +1273,170 @@ class LiveTriangleState {
     }
 
     if (options.logDecision !== false) {
-      this.logDecision(row);
+      if (options.logDecision === "bounded") {
+        this.logDecision(row, {
+          detailed: row.strategyAccepted === true,
+          stateChanged,
+        });
+      } else {
+        this.logDecision(row, { stateChanged });
+      }
       this.enqueueExecutionCandidate(row, cycle, validationOrderbooks);
     }
 
     return row;
+  }
+
+  queueCycleRecalculation(cycleIds, options = {}) {
+    const ids = Array.isArray(cycleIds) ? cycleIds : [...cycleIds || []];
+    const reason = options.reason || "dirty";
+
+    for (const cycleId of ids) {
+      if (!this.cycleIndex.has(cycleId)) continue;
+      this.pendingCycleIds.add(cycleId);
+      this.pendingCycleMetadata.set(cycleId, {
+        reason,
+        warmup: options.warmup === true,
+        markDirty: options.markDirty !== false,
+        lastChangedMarket: options.lastChangedMarket || null,
+        lastUpbitTimestampMs: options.lastUpbitTimestampMs || null,
+        timings: options.timings || null,
+      });
+    }
+
+    this.schedulerStats.queuedCycleCount += ids.length;
+    this.updatePendingReasonCounts();
+    this.scheduleCycleProcessing();
+    return this.pendingCycleIds.size;
+  }
+
+  queueMarketRecalculation(feedName, orderbook, cycleIds, options = {}) {
+    if (orderbook && orderbook.market) {
+      this.pendingDirtyMarkets.set(`${feedName}:${orderbook.market}`, {
+        feedName,
+        market: orderbook.market,
+        traceId: orderbook.traceId,
+        localSequence: orderbook.localSequence,
+        exchangeTimestampMs: orderbook.exchangeTimestampMs,
+        serverReceivedAtMs: orderbook.serverReceivedAtMs,
+        reason: options.reason || "market",
+        queuedAt: new Date().toISOString(),
+      });
+    }
+
+    return this.queueCycleRecalculation(cycleIds, options);
+  }
+
+  updatePendingReasonCounts() {
+    const counts = {};
+
+    for (const metadata of this.pendingCycleMetadata.values()) {
+      const reason = metadata.reason || "dirty";
+      counts[reason] = (counts[reason] || 0) + 1;
+    }
+
+    this.schedulerStats.pendingReasonCounts = counts;
+    return counts;
+  }
+
+  scheduleCycleProcessing() {
+    if (this.schedulerTimer || this.schedulerRunning || this.pendingCycleIds.size === 0) {
+      return;
+    }
+
+    this.schedulerTimer = setTimeout(() => {
+      this.schedulerTimer = null;
+      this.processPendingCycles().catch((error) => {
+        this.logEvent("error", {
+          source: "cycle-scheduler",
+          message: error.message,
+        });
+      });
+    }, Math.max(0, this.scheduler.intervalMs));
+
+    if (typeof this.schedulerTimer.unref === "function") {
+      this.schedulerTimer.unref();
+    }
+  }
+
+  stopScheduler() {
+    if (this.schedulerTimer) {
+      clearTimeout(this.schedulerTimer);
+      this.schedulerTimer = null;
+    }
+  }
+
+  async processPendingCycles(options = {}) {
+    if (this.schedulerRunning || this.pendingCycleIds.size === 0) {
+      return {
+        processed: 0,
+        remaining: this.pendingCycleIds.size,
+      };
+    }
+
+    this.schedulerRunning = true;
+    const startedAt = performance.now();
+    const maxCycles = Math.max(1, Number.parseInt(options.maxCycles || this.scheduler.maxCyclesPerTick, 10));
+    const maxTickMs = Math.max(1, Number.parseInt(options.maxTickMs || this.scheduler.maxTickMs, 10));
+    const calculationOrderbooks = this.getCalculationOrderbooks();
+    const validationOrderbooks = this.getValidationOrderbooks();
+    let processed = 0;
+    this.schedulerStats.lastDirtyMarketCount = this.pendingDirtyMarkets.size;
+    this.pendingDirtyMarkets.clear();
+
+    try {
+      while (this.pendingCycleIds.size > 0 && processed < maxCycles) {
+        if (performance.now() - startedAt >= maxTickMs && processed > 0) {
+          break;
+        }
+
+        const cycleId = this.pendingCycleIds.values().next().value;
+        const metadata = this.pendingCycleMetadata.get(cycleId) || {};
+        this.pendingCycleIds.delete(cycleId);
+        this.pendingCycleMetadata.delete(cycleId);
+
+        this.recalculateCycle(cycleId, {
+          calculationOrderbooks,
+          validationOrderbooks,
+          markDirty: metadata.markDirty !== false,
+          lastChangedMarket: metadata.lastChangedMarket,
+          lastUpbitTimestampMs: metadata.lastUpbitTimestampMs,
+          timings: metadata.timings || undefined,
+          logDecision: "bounded",
+        });
+        processed += 1;
+      }
+    } finally {
+      const duration = performance.now() - startedAt;
+      this.schedulerRunning = false;
+      this.schedulerStats.processedCycleCount += processed;
+      this.schedulerStats.lastProcessedAt = processed > 0 ? new Date().toISOString() : this.schedulerStats.lastProcessedAt;
+      this.schedulerStats.lastTickProcessed = processed;
+      this.schedulerStats.lastTickDurationMs = duration;
+      this.updatePendingReasonCounts();
+
+      if (this.pendingCycleIds.size === 0 && this.cycles.length > 0 && !this.schedulerStats.warmupCompleteAt) {
+        const rows = this.cycles.map((cycle) => this.cycleRows.get(cycle.cycleId)).filter(Boolean);
+        if (rows.length === this.cycles.length && rows.every((row) => row.status !== "warming")) {
+          this.schedulerStats.warmupCompleteAt = new Date().toISOString();
+          this.logEvent("cycle-warmup-complete", {
+            cycleCount: this.cycles.length,
+          });
+        }
+      }
+
+      if (this.pendingCycleIds.size > 0) {
+        this.scheduleCycleProcessing();
+      } else {
+        this.flushDecisionSummary(Date.now(), { force: true });
+      }
+    }
+
+    return {
+      processed,
+      remaining: this.pendingCycleIds.size,
+      durationMs: performance.now() - startedAt,
+    };
   }
 
   recalculateCycles(cycleIds, options = {}) {
@@ -1048,42 +1456,35 @@ class LiveTriangleState {
     return this.recalculateCycles(this.cycles.map((cycle) => cycle.cycleId), options);
   }
 
-  buildCycleRows(now = new Date()) {
-    this.recalculateAll({
-      nowMs: now.getTime(),
-      markDirty: false,
-      logDecision: false,
-    });
-
-    return this.cycles.map((cycle) => this.cycleRows.get(cycle.cycleId)).filter(Boolean);
+  buildCycleRows() {
+    return this.cycles
+      .map((cycle) => this.cycleRows.get(cycle.cycleId) || pendingCycleRow(cycle))
+      .filter(Boolean);
   }
 
   refreshAgingCycles(now = new Date()) {
     const nowMs = now.getTime();
-    const previousRows = new Map(this.cycleRows);
-    const rows = this.recalculateAll({
-      nowMs,
-      markDirty: false,
-      logDecision: false,
-    });
-
-    for (const row of rows) {
-      const previous = previousRows.get(row.cycleId);
-
-      if (
-        !previous ||
-        previous.status !== row.status ||
-        previous.staleReason !== row.staleReason ||
-        previous.unavailableReason !== row.unavailableReason ||
-        previous.validationStatus !== row.validationStatus ||
-        previous.validationReason !== row.validationReason ||
-        previous.strategyAccepted !== row.strategyAccepted ||
-        previous.strategyReason !== row.strategyReason ||
-        previous.executionFeasibility !== row.executionFeasibility
-      ) {
-        this.dirtyCycleIds.add(row.cycleId);
-      }
+    if (
+      this.cycles.length > 0 &&
+      this.scheduler.fullAgingSweepMs > 0 &&
+      nowMs - this.lastFullAgingQueueAt >= this.scheduler.fullAgingSweepMs
+    ) {
+      this.lastFullAgingQueueAt = nowMs;
+      this.queueCycleRecalculation(this.cycles.map((cycle) => cycle.cycleId), {
+        reason: "aging",
+        markDirty: true,
+      });
     }
+
+    this.processPendingCycles({
+      maxCycles: this.scheduler.maxCyclesPerTick,
+      maxTickMs: this.scheduler.maxTickMs,
+    }).catch((error) => {
+      this.logEvent("error", {
+        source: "cycle-aging",
+        message: error.message,
+      });
+    });
 
     return this.dirtyCycleIds.size;
   }
@@ -1115,6 +1516,7 @@ class LiveTriangleState {
   getSummary(cycles) {
     const availableCount = cycles.filter((cycle) => cycle.status === "available").length;
     const unavailableCount = cycles.length - availableCount;
+    const warmingCount = cycles.filter((cycle) => cycle.status === "warming" || cycle.validationStatus === "pending").length;
     const feeMetrics = computeFeeMetrics(this.feeRate);
     const startAssetCounts = cycles.reduce((counts, cycle) => {
       counts[cycle.startAsset] = (counts[cycle.startAsset] || 0) + 1;
@@ -1131,6 +1533,9 @@ class LiveTriangleState {
       reverseCycleCount: this.cycles.filter((cycle) => cycle.direction === "reverse").length,
       availableLiveMultipliers: availableCount,
       unavailableOrStaleCycles: unavailableCount,
+      warmingCycleCount: warmingCount,
+      pendingCycleCount: this.pendingCycleIds.size,
+      cycleScheduler: this.getSchedulerStatus(),
       feeRate: this.feeRate,
       executableBreakEvenGross: feeMetrics.executableBreakEvenGross,
       lastUpdateTime: this.lastOrderbookReceivedAt,
@@ -1168,7 +1573,7 @@ class LiveTriangleState {
   }
 
   getSnapshot(now = new Date()) {
-    const cycles = this.buildCycleRows(now);
+    const cycles = this.buildCycleRows();
 
     this.lastCalculatedAt = now.toISOString();
 
@@ -1178,7 +1583,7 @@ class LiveTriangleState {
       groups: this.groups,
       groupCounts: this.groupCounts,
       xRange: this.xRange,
-      cycles,
+      cycles: cycles.map(compactCycleForSnapshot),
       serverStartedAt: this.serverStartedAt,
       lastCalculatedAt: this.lastCalculatedAt,
       wsStatus: this.wsStatus,
@@ -1209,6 +1614,7 @@ class LiveTriangleState {
       wsStatus: this.wsStatus,
       marketsLoaded: this.marketRows.length,
       cycles: this.cycles.length,
+      cycleScheduler: this.getSchedulerStatus(),
       lastOrderbookReceivedAt: this.lastOrderbookReceivedAt,
       metrics: this.metrics.snapshot(this.wsStatus),
       runtimeConfig: this.runtimeConfig,
@@ -1219,6 +1625,35 @@ class LiveTriangleState {
       },
       strategy: this.getStrategySnapshot(),
       engineState: this.engineState,
+    };
+  }
+
+  getSchedulerStatus() {
+    return {
+      pendingCycleCount: this.pendingCycleIds.size,
+      totalCycleCount: this.cycles.length,
+      completedCycleCount: this.cycles.filter((cycle) => {
+        const row = this.cycleRows.get(cycle.cycleId);
+        return row && row.status !== "warming";
+      }).length,
+      warmupComplete: this.cycles.length === 0
+        ? true
+        : this.schedulerStats.warmupCompleteAt !== null || this.cycles.every((cycle) => {
+            const row = this.cycleRows.get(cycle.cycleId);
+            return row && row.status !== "warming";
+          }),
+      warmupCompleteAt: this.schedulerStats.warmupCompleteAt,
+      maxCyclesPerTick: this.scheduler.maxCyclesPerTick,
+      maxTickMs: this.scheduler.maxTickMs,
+      fullAgingSweepMs: this.scheduler.fullAgingSweepMs,
+      lastProcessedAt: this.schedulerStats.lastProcessedAt,
+      lastTickProcessed: this.schedulerStats.lastTickProcessed,
+      lastTickDurationMs: this.schedulerStats.lastTickDurationMs,
+      processedCycleCount: this.schedulerStats.processedCycleCount,
+      queuedCycleCount: this.schedulerStats.queuedCycleCount,
+      pendingReasonCounts: this.schedulerStats.pendingReasonCounts,
+      pendingMarketCount: this.pendingDirtyMarkets.size,
+      lastDirtyMarketCount: this.schedulerStats.lastDirtyMarketCount,
     };
   }
 }

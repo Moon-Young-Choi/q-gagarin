@@ -49,6 +49,39 @@ test("CLI status reads snapshot without HTTP or browser objects", async () => {
   assert.match(result.output, /Markets loaded\s+3/);
 });
 
+test("CLI status marks active snapshots stale when engine pid is dead", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-cli-stale-status-"));
+  const snapshotPath = path.join(dir, "latest-snapshot.json");
+  await fs.writeFile(snapshotPath, JSON.stringify({
+    engineState: "RUNNING",
+    lastCalculatedAt: new Date().toISOString(),
+    engineProcess: {
+      pid: 99999999,
+    },
+    runtimeConfig: {
+      runMode: "OBSERVE",
+      exchange: "upbit",
+      liveTradingEnabled: false,
+    },
+    summary: {
+      marketsLoaded: 3,
+      uniqueTriangleCount: 1,
+      plottedCycleCount: 2,
+    },
+  }));
+  const context = createCliContext({
+    runtimeDir: dir,
+    logDir: path.join(dir, "logs"),
+    snapshotPath,
+    output: memoryOutput(),
+  });
+
+  const result = await runOnce(parseSlashCommand("/status"), context);
+
+  assert.match(result.output, /Engine\s+STALE \(RUNNING\)/);
+  assert.match(result.output, /Engine pid alive\s+no/);
+});
+
 test("CLI latency hides legacy browser metrics from stale snapshots", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-cli-latency-"));
   const snapshotPath = path.join(dir, "latest-snapshot.json");

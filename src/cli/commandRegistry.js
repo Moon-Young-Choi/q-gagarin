@@ -105,6 +105,69 @@ function engineState(snapshot = {}) {
   return snapshot.engineState || (snapshot.engine && snapshot.engine.state) || "UNKNOWN";
 }
 
+function snapshotTimestampMs(snapshot = {}) {
+  const candidates = [
+    snapshot.lastCalculatedAt,
+    snapshot.summary && snapshot.summary.lastUpdateTime,
+    snapshot.serverStartedAt,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = Date.parse(candidate || "");
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return null;
+}
+
+function isProcessAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return null;
+
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    if (error.code === "EPERM") return true;
+    return null;
+  }
+}
+
+function runtimeLiveness(snapshot = {}, options = {}) {
+  const state = engineState(snapshot);
+  const pid = snapshot.engineProcess && snapshot.engineProcess.pid;
+  const pidAlive = isProcessAlive(pid);
+  const timestampMs = snapshotTimestampMs(snapshot);
+  const nowMs = options.nowMs || Date.now();
+  const ageMs = timestampMs === null ? null : Math.max(0, nowMs - timestampMs);
+  const staleAfterMs = Number.parseInt(
+    options.staleAfterMs || process.env.Q_GAGARIN_STALE_SNAPSHOT_MS || "15000",
+    10,
+  );
+  const stateLooksActive = ["RUNNING", "PAUSED", "ERROR"].includes(state);
+  const staleByPid = stateLooksActive && pidAlive === false;
+  const staleByAge = stateLooksActive &&
+    ageMs !== null &&
+    Number.isFinite(staleAfterMs) &&
+    staleAfterMs > 0 &&
+    ageMs > staleAfterMs;
+  const effectiveState = staleByPid || staleByAge
+    ? `STALE (${state})`
+    : state;
+
+  return {
+    state,
+    effectiveState,
+    pid,
+    pidAlive,
+    ageMs,
+    staleByPid,
+    staleByAge,
+    staleAfterMs,
+  };
+}
+
 function runtimeConfig(snapshot = {}) {
   return snapshot.runtimeConfig || {};
 }
@@ -116,11 +179,13 @@ function summary(snapshot = {}) {
 function renderStatus(snapshot = {}) {
   const config = runtimeConfig(snapshot);
   const stateSummary = summary(snapshot);
+  const liveness = runtimeLiveness(snapshot);
+  const scheduler = stateSummary.cycleScheduler || snapshot.cycleScheduler || {};
 
   return [
     "Status",
     renderKeyValues([
-      ["Engine", engineState(snapshot)],
+      ["Engine", liveness.effectiveState],
       ["Mode", config.runMode || "OBSERVE"],
       ["Exchange", config.exchange || "upbit"],
       ["Live trading", config.liveTradingEnabled === true],
@@ -128,6 +193,10 @@ function renderStatus(snapshot = {}) {
       ["Triangles", stateSummary.uniqueTriangleCount || stateSummary.uniqueTriangles || 0],
       ["Plotted cycles", stateSummary.plottedCycleCount || 0],
       ["Available multipliers", stateSummary.availableLiveMultipliers || 0],
+      ["Warm-up", scheduler.totalCycleCount ? `${scheduler.completedCycleCount || 0}/${scheduler.totalCycleCount}` : "-"],
+      ["Pending cycles", scheduler.pendingCycleCount ?? stateSummary.pendingCycleCount ?? 0],
+      ["Snapshot age ms", liveness.ageMs ?? "-"],
+      ["Engine pid alive", liveness.pidAlive === null ? "-" : liveness.pidAlive],
       ["Last update", stateSummary.lastUpdateTime || snapshot.lastCalculatedAt || "-"],
     ]),
   ].join("\n");
@@ -526,15 +595,23 @@ function deskTableRows(rows) {
 function renderDesk(snapshot = {}, options = {}, context = {}) {
   const startFilter = String(options.start || options.args && options.args[0] || "").toUpperCase();
   const filtered = rankedDeskRows(snapshot, options);
+  const stateSummary = summary(snapshot);
+  const scheduler = stateSummary.cycleScheduler || snapshot.cycleScheduler || {};
+  const warmupLine = scheduler.totalCycleCount && (
+    scheduler.pendingCycleCount > 0 || scheduler.warmupComplete === false
+  )
+    ? `Warm-up ${scheduler.completedCycleCount || 0}/${scheduler.totalCycleCount}; pending ${scheduler.pendingCycleCount || 0}`
+    : "";
 
   context.lastDeskRows = filtered;
 
   return [
     `Arbitrage Desk${startFilter ? ` - ${startFilter}` : ""}`,
+    warmupLine,
     filtered.length > 0
       ? renderTable(["#", "Start", "Route", "Net", "ExecAmt", "LimitLeg", "Status"], deskTableRows(filtered))
       : "No opportunities in latest snapshot.",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function exportDesk(snapshot = {}, options = {}, context = {}) {
@@ -1169,6 +1246,7 @@ module.exports = {
   helpText,
   logRecordKey,
   modeFromStartArg,
+  runtimeLiveness,
   renderDesk,
   renderExecution,
   renderMarket,

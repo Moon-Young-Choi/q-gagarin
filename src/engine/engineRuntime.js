@@ -357,6 +357,9 @@ class EngineRuntime {
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     if (this.deltaTimer) clearInterval(this.deltaTimer);
     if (this.fallbackTimer) clearInterval(this.fallbackTimer);
+    if (this.state && typeof this.state.stopScheduler === "function") {
+      this.state.stopScheduler();
+    }
     this.stopFeeds();
     await this.writeSnapshot();
   }
