@@ -129,6 +129,48 @@ test("CLI start queues atomic command inbox file", async () => {
   assert.equal(status.status, "queued");
 });
 
+test("CLI start prints readiness failures when real-guarded command is rejected", async () => {
+  const context = createCliContext({
+    runtimeDir: "/tmp/q-gagarin-cli-readiness",
+    logDir: "/tmp/q-gagarin-cli-readiness/logs",
+    commandQueue: {
+      async queue(payload) {
+        assert.equal(payload.command, "Start");
+        assert.equal(payload.runMode, "REAL_GUARDED");
+        return {
+          ok: true,
+          command: "Start",
+          commandId: "cmd-readiness",
+          runMode: "REAL_GUARDED",
+          source: "cli",
+          status: "queued",
+        };
+      },
+      async readStatus(commandId) {
+        assert.equal(commandId, "cmd-readiness");
+        return {
+          status: "rejected",
+          command: "Start",
+          runMode: "REAL_GUARDED",
+          source: "cli",
+          message: "REAL_GUARDED readiness checklist failed",
+          failedItems: ["dry-run-sample-count", "private-ws-connected"],
+        };
+      },
+    },
+    output: memoryOutput(),
+    pollIntervalMs: 1,
+    statusPollTimeoutMs: 1,
+  });
+
+  const result = await runOnce(parseSlashCommand("/start real-guarded"), context);
+
+  assert.match(result.output, /Status\s+rejected/);
+  assert.match(result.output, /REAL_GUARDED readiness checklist failed/);
+  assert.match(result.output, /dry-run-sample-count/);
+  assert.match(result.output, /private-ws-connected/);
+});
+
 test("CLI desk exports ranking and opportunity detail without Plotly", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-cli-desk-"));
   const snapshotPath = path.join(dir, "latest-snapshot.json");

@@ -339,6 +339,48 @@ test("engine runtime processes atomic command inbox files once", async () => {
   assert.equal(pending.length, 0);
 });
 
+test("engine runtime records readiness failures for rejected real-guarded CLI starts", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-command-readiness-"));
+  const logStore = new AppendOnlyLogStore({ logDir: path.join(dir, "logs") });
+  const commandStatusStore = new CommandStatusStore({ runtimeDir: dir });
+  const commandInbox = new CommandInbox({
+    runtimeDir: dir,
+    randomUUID: () => "88888888-8888-4888-8888-888888888888",
+    now: () => new Date("2026-07-06T12:00:00.000Z"),
+  });
+  await logStore.ensureFiles();
+  await commandInbox.enqueue({
+    command: "Start",
+    runMode: "REAL_GUARDED",
+    source: "cli",
+  });
+  const observationClient = fakeWsClient();
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore,
+    commandInbox,
+    state: fakeState(),
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    observationClient,
+    validationClient: fakeWsClient(),
+    validationFeedStartDelayMs: 0,
+    startedAtEpochMs: Date.now() - 1000,
+  });
+
+  await runtime.processCommands();
+  const status = await commandStatusStore.read("88888888-8888-4888-8888-888888888888");
+  const events = await logStore.readAll("events");
+
+  assert.equal(runtime.machine.state, "STOPPED");
+  assert.equal(observationClient.starts, 0);
+  assert.equal(status.status, "rejected");
+  assert.match(status.message, /REAL_GUARDED readiness checklist failed/);
+  assert.equal(status.readiness.passed, false);
+  assert.equal(status.failedItems.length > 0, true);
+  assert.equal(events.some((event) => event.type === "readiness.blocked" && event.readiness.passed === false), true);
+});
+
 test("engine runtime rejects unsafe queued operator command metadata", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-command-policy-"));
   const logStore = new AppendOnlyLogStore({ logDir: path.join(dir, "logs") });

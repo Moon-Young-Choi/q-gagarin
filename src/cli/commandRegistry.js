@@ -928,6 +928,11 @@ async function queueEngineCommand(context, payload) {
   const queued = await context.commandQueue.queue(payload);
   const status = await pollCommandStatus(context, queued.commandId);
   const effectiveStatus = status || queued;
+  const failedItems = Array.isArray(effectiveStatus.failedItems)
+    ? effectiveStatus.failedItems
+    : effectiveStatus.readiness && Array.isArray(effectiveStatus.readiness.items)
+      ? effectiveStatus.readiness.items.filter((item) => !item.passed).map((item) => item.id)
+      : [];
 
   return [
     `Command queued: ${queued.command} (${queued.commandId})`,
@@ -937,6 +942,7 @@ async function queueEngineCommand(context, payload) {
       ["Source", effectiveStatus.source || queued.source || "cli"],
       ["Message", effectiveStatus.message || "-"],
     ]),
+    failedItems.length > 0 ? renderTable(["Readiness failure"], failedItems.map((item) => [item])) : "",
   ].join("\n");
 }
 

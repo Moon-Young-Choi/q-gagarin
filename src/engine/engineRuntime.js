@@ -435,6 +435,7 @@ class EngineRuntime {
     }
 
     if (command === "Start" && String(this.runtimeConfig.runMode || "").startsWith("REAL_")) {
+      const blockedRunMode = this.runtimeConfig.runMode;
       const readiness = await this.checkReadiness();
       if (!readiness.passed) {
         if (configChanged) {
@@ -447,7 +448,9 @@ class EngineRuntime {
           readiness,
           ...metadata,
         });
-        throw new Error(`${this.runtimeConfig.runMode} readiness checklist failed`);
+        const error = new Error(`${blockedRunMode} readiness checklist failed`);
+        error.readiness = readiness;
+        throw error;
       }
     }
 
@@ -559,12 +562,17 @@ class EngineRuntime {
           message: error.message,
         });
         if (commandRecord.commandId) {
+          const failedItems = error.readiness && Array.isArray(error.readiness.items)
+            ? error.readiness.items.filter((item) => !item.passed).map((item) => item.id)
+            : undefined;
           await this.commandStatusStore.write(commandRecord.commandId, {
             status: "rejected",
             command: commandRecord.command,
             runMode: commandRecord.runMode,
             source: commandRecord.source || "cli",
             message: error.message,
+            ...(error.readiness ? { readiness: error.readiness } : {}),
+            ...(failedItems ? { failedItems } : {}),
           });
         }
       } finally {
@@ -600,12 +608,17 @@ class EngineRuntime {
           message: error.message,
         });
         if (commandRecord.commandId) {
+          const failedItems = error.readiness && Array.isArray(error.readiness.items)
+            ? error.readiness.items.filter((item) => !item.passed).map((item) => item.id)
+            : undefined;
           await this.commandStatusStore.write(commandRecord.commandId, {
             status: "rejected",
             command: commandRecord.command,
             runMode: commandRecord.runMode,
             source: commandRecord.source || "cli",
             message: error.message,
+            ...(error.readiness ? { readiness: error.readiness } : {}),
+            ...(failedItems ? { failedItems } : {}),
           });
         }
       }
