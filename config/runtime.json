@@ -30,7 +30,8 @@
       },
       "maxConsecutiveFailures": 3,
       "maxOpenOrders": 3,
-      "maxCyclesPerMinute": 5
+      "maxCyclesPerMinute": 5,
+      "maxActiveTriangleExecutions": 1
     },
     "marketDataGuards": {
       "maxOldestLegAgeMs": null,

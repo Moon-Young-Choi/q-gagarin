@@ -681,7 +681,7 @@ test("real executor rejects orders above market maximum total before submission"
   assert.equal(events.some((event) => event.type === "cycle.aborted" && event.reason === "MAX_ORDER_TOTAL"), true);
 });
 
-test("real executor reprices each leg from latest validation orderbooks", async () => {
+test("real executor prices each leg from latest validation orderbooks", async () => {
   const submitted = [];
   const events = [];
   const validationSnapshots = [
@@ -716,7 +716,7 @@ test("real executor reprices each leg from latest validation orderbooks", async 
   });
 
   const result = await executor.execute({
-    planId: "real-reprice",
+    planId: "real-latest-leg-price",
     cycle,
     startAmount: 100,
     validationOrderbooks: validationSnapshots[0],
@@ -733,11 +733,10 @@ test("real executor reprices each leg from latest validation orderbooks", async 
   assert.equal(result.ok, true);
   assert.equal(submitted[0].price, "100");
   assert.equal(submitted[1].price, "80");
-  assert.equal(events.some((event) => event.type === "execution.reprice" && event.legIndex === 2), true);
-  assert.equal(events.some((event) => event.type === "execution.state_changed" && event.executionState === "REPRICE_BEFORE_LEG_2"), true);
+  assert.equal(events.some((event) => event.type === "cycle.aborted"), false);
 });
 
-test("real executor recovers to start asset when repriced profit deteriorates", async () => {
+test("real executor continues through deteriorated leg pricing", async () => {
   const submitted = [];
   const events = [];
   const deepOrderbook = (askPrice, bidPrice) => ({
@@ -777,11 +776,10 @@ test("real executor recovers to start asset when repriced profit deteriorates", 
   });
 
   const result = await executor.execute({
-    planId: "real-recover",
+    planId: "real-no-recover",
     cycle,
     startAmount: 10000,
     expectedOutputAmount: 11000,
-    recoverOnRepriceLoss: true,
     validationOrderbooks: validationSnapshots[0],
   }, {
     privateWsConnected: true,
@@ -793,13 +791,11 @@ test("real executor recovers to start asset when repriced profit deteriorates", 
     },
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.recoveredToStart, true);
-  assert.equal(result.reason, "REPRICE_PROFIT_DETERIORATED");
+  assert.equal(result.ok, true);
   assert.equal(submitted.length, 2);
   assert.equal(submitted[1].side, "ask");
   assert.equal(submitted[1].price, "80");
-  assert.equal(events.some((event) => event.type === "cycle.aborted" && event.recoveredToStart === true), true);
+  assert.equal(events.some((event) => event.type === "cycle.aborted"), false);
 });
 
 test("real executor records residual input when liquidity policy caps the submitted order", async () => {
@@ -1137,4 +1133,121 @@ test("real executor can abort partial fills by policy", async () => {
   assert.equal(events.some((event) => event.executionState === "CYCLE_RESIDUAL"), true);
   assert.equal(events.some((event) => event.type === "cycle.aborted" && event.reason === "PARTIAL_FILL_ABORTED_BY_POLICY"), true);
   assert.equal(events.some((event) => event.type === "cycle.real_fail" && event.canonicalType === "cycle.aborted"), true);
+});
+
+test("real executor requests balance refresh after fills and cycle completion", async () => {
+  const submitted = [];
+  const refreshes = [];
+  const executor = new RealExecutor({
+    liveTradingEnabled: true,
+    runtimeConfig: {
+      executionMode: "LIMIT_IOC_AT_OBSERVED_BEST",
+      candidateValidation: { minOrderAmountByAsset: { BTC: 0, KRW: 0 } },
+      executionPolicy: {
+        partialFillPolicy: "CONTINUE_IF_ABOVE_MIN",
+        realRunLimits: {},
+        marketDataGuards: {},
+        executionGuards: {},
+      },
+    },
+    restClient: {
+      async getOrderChance() {
+        return zeroMinMarketPolicy();
+      },
+      async createOrder(order) {
+        submitted.push(order);
+        return { uuid: `uuid-${submitted.length}`, ...order };
+      },
+      async getOrder(params) {
+        const order = submitted.find((item) => item.identifier === params.identifier);
+        return {
+          ...order,
+          uuid: params.uuid,
+          executed_volume: order.volume || "1",
+          remaining_volume: "0",
+          avg_price: order.price || "100",
+          paid_fee: "0",
+        };
+      },
+    },
+  });
+
+  const result = await executor.execute({
+    planId: "real-balance-refresh",
+    cycle,
+    startAmount: 100,
+    validationOrderbooks: new Map([["KRW-BTC", orderbook()]]),
+  }, {
+    privateWsConnected: true,
+    orderChanceFresh: true,
+    accountBalanceFresh: true,
+    validationDepthFresh: true,
+    refreshAccountBalances(metadata) {
+      refreshes.push(metadata);
+      return Promise.resolve({ ok: true });
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(submitted.length, 2);
+  assert.equal(refreshes.filter((entry) => entry.reason === "ORDER_FILL").length, 2);
+  assert.equal(refreshes.some((entry) => entry.reason === "CYCLE_DONE" && entry.force === true), true);
+});
+
+test("real executor ignores balance refresh failures", async () => {
+  const submitted = [];
+  const events = [];
+  const executor = new RealExecutor({
+    liveTradingEnabled: true,
+    logStore: memoryLogStore(events),
+    runtimeConfig: {
+      executionMode: "LIMIT_IOC_AT_OBSERVED_BEST",
+      candidateValidation: { minOrderAmountByAsset: { BTC: 0, KRW: 0 } },
+      executionPolicy: {
+        partialFillPolicy: "CONTINUE_IF_ABOVE_MIN",
+        realRunLimits: {},
+        marketDataGuards: {},
+        executionGuards: {},
+      },
+    },
+    restClient: {
+      async getOrderChance() {
+        return zeroMinMarketPolicy();
+      },
+      async createOrder(order) {
+        submitted.push(order);
+        return { uuid: `uuid-${submitted.length}`, ...order };
+      },
+      async getOrder(params) {
+        const order = submitted.find((item) => item.identifier === params.identifier);
+        return {
+          ...order,
+          uuid: params.uuid,
+          executed_volume: order.volume || "1",
+          remaining_volume: "0",
+          avg_price: order.price || "100",
+          paid_fee: "0",
+        };
+      },
+    },
+  });
+
+  const result = await executor.execute({
+    planId: "real-balance-refresh-fails",
+    cycle,
+    startAmount: 100,
+    validationOrderbooks: new Map([["KRW-BTC", orderbook()]]),
+  }, {
+    privateWsConnected: true,
+    orderChanceFresh: true,
+    accountBalanceFresh: true,
+    validationDepthFresh: true,
+    refreshAccountBalances() {
+      throw new Error("accounts unavailable");
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(submitted.length, 2);
+  assert.equal(events.some((event) => event.type === "balance.refresh_failed" && event.message === "accounts unavailable"), true);
 });

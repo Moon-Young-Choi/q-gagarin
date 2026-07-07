@@ -1743,3 +1743,379 @@ test("engine runtime refuses real execution before injected executor when live t
   assert.equal(executeCalls, 0);
   assert.equal(errors.some((entry) => entry.type === "real_execution_refused" && entry.reason === "LIVE_TRADING_DISABLED"), true);
 });
+
+test("engine runtime skips real candidates while another triangle is active", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-real-busy-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  let executeCalls = 0;
+  await logStore.ensureFiles();
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    realExecutor: {
+      async execute() {
+        executeCalls += 1;
+        return { ok: true };
+      },
+    },
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+  runtime.activeRealExecutionCount = 1;
+
+  const result = await runtime.handleExecutionCandidate({
+    planId: "plan-busy",
+    cycleId: "cycle-busy",
+    startAsset: "KRW",
+    strategyId: "bestLevelResidualIoc",
+    cycle: { cycleId: "cycle-busy", startAsset: "KRW" },
+  });
+  const events = await logStore.readAll("events");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REAL_EXECUTION_BUSY");
+  assert.equal(executeCalls, 0);
+  assert.equal(events.some((event) => event.type === "execution.skipped" && event.reason === "REAL_EXECUTION_BUSY"), true);
+});
+
+test("engine runtime does not apply real busy guard to dry-run candidates", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-dry-not-busy-"));
+  let executeCalls = 0;
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore: new AppendOnlyLogStore({ logDir: path.join(dir, "logs") }),
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "DRY_RUN",
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    dryRunExecutor: {
+      execute(plan) {
+        executeCalls += 1;
+        return { ok: true, planId: plan.planId };
+      },
+      get balances() {
+        return {};
+      },
+      capitalSnapshot() {
+        return { buckets: {} };
+      },
+    },
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+  runtime.activeRealExecutionCount = 1;
+
+  const result = await runtime.handleExecutionCandidate({
+    planId: "plan-dry",
+    cycleId: "cycle-dry",
+    startAsset: "KRW",
+    cycle: { cycleId: "cycle-dry", startAsset: "KRW" },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(executeCalls, 1);
+});
+
+test("engine runtime accepts a new real candidate after the active triangle finishes", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-real-serial-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  const executed = [];
+  await logStore.ensureFiles();
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    realExecutor: {
+      async execute(plan) {
+        executed.push(plan.planId);
+        return {
+          ok: false,
+          mode: "REAL",
+          reason: "TEST_DONE",
+          planId: plan.planId,
+          cycleId: plan.cycleId,
+          startAsset: plan.startAsset,
+        };
+      },
+    },
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+
+  await runtime.handleExecutionCandidate({
+    planId: "plan-one",
+    cycleId: "cycle-one",
+    startAsset: "KRW",
+    cycle: { cycleId: "cycle-one", startAsset: "KRW" },
+  });
+  await runtime.handleExecutionCandidate({
+    planId: "plan-two",
+    cycleId: "cycle-two",
+    startAsset: "KRW",
+    cycle: { cycleId: "cycle-two", startAsset: "KRW" },
+  });
+
+  assert.deepEqual(executed, ["plan-one", "plan-two"]);
+  assert.equal(runtime.activeRealExecutionCount, 0);
+});
+
+test("engine runtime refreshes stale execution private caches for the candidate markets before real execution", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-exec-cache-refresh-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  const orderChanceMarkets = [];
+  let accountReads = 0;
+  let capturedContext = null;
+  await logStore.ensureFiles();
+
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    restClient: {
+      async getAccounts() {
+        accountReads += 1;
+        return [{ currency: "KRW", balance: "30000", locked: "0" }];
+      },
+      async getOrderChance(market) {
+        orderChanceMarkets.push(market);
+        return {
+          market: {
+            id: market,
+            bid: { minTotal: "5000" },
+            ask: { minTotal: "5000" },
+          },
+          bidFee: 0.0005,
+          askFee: 0.0005,
+          makerBidFee: 0.0005,
+          makerAskFee: 0.0005,
+        };
+      },
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    realExecutor: {
+      async execute(plan, context) {
+        capturedContext = context;
+        return {
+          ok: false,
+          mode: "REAL",
+          reason: "TEST_DONE",
+          planId: plan.planId,
+          cycleId: plan.cycleId,
+          startAsset: plan.startAsset,
+        };
+      },
+    },
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+  runtime.accountBalanceUpdatedAt = 0;
+  runtime.orderChanceCacheUpdatedAt = 0;
+
+  const result = await runtime.handleExecutionCandidate({
+    planId: "plan-private-cache",
+    cycleId: "cycle-private-cache",
+    startAsset: "KRW",
+    cycle: {
+      cycleId: "cycle-private-cache",
+      startAsset: "KRW",
+      steps: [
+        { index: 0, market: "KRW-BTC" },
+        { index: 1, market: "BTC-ADA" },
+        { index: 2, market: "KRW-ADA" },
+      ],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "TEST_DONE");
+  assert.equal(accountReads, 1);
+  assert.deepEqual(orderChanceMarkets.sort(), ["BTC-ADA", "KRW-ADA", "KRW-BTC"]);
+  assert.equal(capturedContext.accountBalanceFresh, true);
+  assert.equal(capturedContext.orderChanceFresh, true);
+  assert.equal(capturedContext.availableBalances.KRW, 30000);
+});
+
+test("engine runtime evaluates order chance freshness against the candidate markets, not every discovered market", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-plan-cache-scope-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  const state = {
+    ...fakeState(),
+    requiredMarkets: ["KRW-BTC", "BTC-ADA"],
+  };
+  await logStore.ensureFiles();
+
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state,
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    restClient: {
+      async getOrderChance(market) {
+        return {
+          market: {
+            id: market,
+            bid: { minTotal: "5000" },
+            ask: { minTotal: "5000" },
+          },
+          bidFee: 0.0005,
+          askFee: 0.0005,
+          makerBidFee: 0.0005,
+          makerAskFee: 0.0005,
+        };
+      },
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    startedAtEpochMs: Date.now() - 1000,
+  });
+
+  await runtime.refreshFeePolicies(["KRW-BTC"]);
+  runtime.updateAccountBalances([{ currency: "KRW", balance: "30000", locked: "0" }], Date.now());
+  const context = runtime.currentGuardContext({
+    cycle: {
+      steps: [{ index: 0, market: "KRW-BTC" }],
+    },
+  });
+
+  assert.equal(runtime.isOrderChanceFresh(), false);
+  assert.equal(context.orderChanceFresh, true);
+  assert.equal(context.accountBalanceFresh, true);
+});
+
+test("engine runtime periodically refreshes real account balances while real run is active", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-periodic-account-refresh-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  let accountReads = 0;
+  await logStore.ensureFiles();
+
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    restClient: {
+      async getAccounts() {
+        accountReads += 1;
+        return [{ currency: "KRW", balance: "12345", locked: "0" }];
+      },
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    privateCacheRefreshIntervalMs: 1000,
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+  runtime.accountBalanceUpdatedAt = 0;
+
+  const result = await runtime.refreshRunningPrivateCaches();
+  const snapshot = runtime.snapshot();
+
+  assert.equal(result.ok, true);
+  assert.equal(accountReads, 1);
+  assert.equal(snapshot.execution.realBalances.availableBalances.KRW, 12345);
+  assert.equal(snapshot.privateCacheStatus.accountBalanceFresh, true);
+});
+
+test("engine runtime refreshes real balances when executor requests account balances", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "q-gagarin-engine-balance-refresh-"));
+  const logStore = new AppendOnlyLogStore({ logDir: dir });
+  await logStore.ensureFiles();
+  const runtime = new EngineRuntime({
+    runtimeDir: dir,
+    logStore,
+    commandStatusStore: new CommandStatusStore({ runtimeDir: dir }),
+    state: fakeState(),
+    runtimeConfig: {
+      ...DEFAULT_RUNTIME_CONFIG,
+      runMode: "REAL_GUARDED",
+      liveTradingEnabled: true,
+    },
+    restClient: {
+      async getAccounts() {
+        return [
+          { currency: "KRW", balance: "30000", locked: "12" },
+          { currency: "BTC", balance: "0.0002", locked: "0" },
+        ];
+      },
+    },
+    observationClient: fakeWsClient(),
+    validationClient: fakeWsClient(),
+    realExecutor: {
+      async execute(plan, context) {
+        await context.refreshAccountBalances({
+          reason: "ORDER_FILL",
+          force: true,
+          planId: plan.planId,
+          cycleId: plan.cycleId,
+        });
+        return {
+          ok: false,
+          mode: "REAL",
+          reason: "TEST_DONE",
+          planId: plan.planId,
+          cycleId: plan.cycleId,
+          startAsset: plan.startAsset,
+        };
+      },
+    },
+    startedAtEpochMs: Date.now() - 1000,
+  });
+  runtime.machine.state = "RUNNING";
+  runtime.state.engineState = "RUNNING";
+
+  await runtime.handleExecutionCandidate({
+    planId: "plan-refresh",
+    cycleId: "cycle-refresh",
+    startAsset: "KRW",
+    cycle: { cycleId: "cycle-refresh", startAsset: "KRW" },
+  });
+  const snapshot = runtime.snapshot();
+
+  assert.equal(snapshot.execution.realBalances.availableBalances.KRW, 30000);
+  assert.equal(snapshot.execution.realBalances.lockedBalances.KRW, 12);
+  assert.equal(snapshot.execution.realBalances.availableBalances.BTC, 0.0002);
+  assert.equal(snapshot.privateCacheStatus.accountBalanceFresh, true);
+});

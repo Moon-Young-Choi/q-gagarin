@@ -92,9 +92,6 @@ function buildExecutionPlan(options = {}) {
     sizingReason: row.sizingReason,
     sizingLiquidityStartAmount: row.sizingLiquidityStartAmount,
     sizingLegs: row.sizingLegs,
-    recoverOnRepriceLoss: options.recoverOnRepriceLoss === true ||
-      row.recoverOnRepriceLoss === true ||
-      (config.executionPolicy && config.executionPolicy.recoverOnRepriceLoss === true),
     limitingLeg: row.limitingLeg,
     limitingMarket: row.limitingMarket,
     expectedSlippageBps: row.expectedSlippageBps,

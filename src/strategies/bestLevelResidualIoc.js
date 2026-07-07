@@ -10,7 +10,6 @@ const strategy = {
   defaultConfig: {
     requireDepthValidation: true,
     sizingMode: "best-level-residual",
-    recoverOnRepriceLoss: true,
   },
 
   evaluate(context) {
@@ -74,7 +73,6 @@ const strategy = {
         strategyAccepted: decision.accepted,
         strategyReason: decision.reason,
       },
-      recoverOnRepriceLoss: true,
     });
   },
 

@@ -29,7 +29,6 @@ const DEFAULT_RUNTIME_CONFIG = {
   executionPolicy: {
     stopPolicy: "CANCEL_OPEN_ORDERS",
     partialFillPolicy: DEFAULT_PARTIAL_FILL_POLICY,
-    recoverOnRepriceLoss: true,
     allowBestIoc: false,
     simulatedBalances: {
       KRW: 1000000,
@@ -50,6 +49,7 @@ const DEFAULT_RUNTIME_CONFIG = {
       maxConsecutiveFailures: 3,
       maxOpenOrders: 3,
       maxCyclesPerMinute: 5,
+      maxActiveTriangleExecutions: 1,
     },
     marketDataGuards: {
       maxOldestLegAgeMs: 1000,
@@ -236,10 +236,6 @@ function validateRuntimeConfig(input, options = {}) {
     throw new Error(`Invalid executionPolicy.partialFillPolicy: ${config.executionPolicy.partialFillPolicy}`);
   }
 
-  if (typeof config.executionPolicy.recoverOnRepriceLoss !== "boolean") {
-    throw new Error("executionPolicy.recoverOnRepriceLoss must be a boolean");
-  }
-
   if (typeof config.executionPolicy.allowBestIoc !== "boolean") {
     throw new Error("executionPolicy.allowBestIoc must be a boolean");
   }
@@ -266,6 +262,7 @@ function validateRuntimeConfig(input, options = {}) {
     maxConsecutiveFailures: config.executionPolicy.realRunLimits.maxConsecutiveFailures,
     maxOpenOrders: config.executionPolicy.realRunLimits.maxOpenOrders,
     maxCyclesPerMinute: config.executionPolicy.realRunLimits.maxCyclesPerMinute,
+    maxActiveTriangleExecutions: config.executionPolicy.realRunLimits.maxActiveTriangleExecutions,
     maxOldestLegAgeMs: config.executionPolicy.marketDataGuards.maxOldestLegAgeMs,
     maxLegTimestampSkewMs: config.executionPolicy.marketDataGuards.maxLegTimestampSkewMs,
     maxExchangeToServerLatencyMs: config.executionPolicy.marketDataGuards.maxExchangeToServerLatencyMs,

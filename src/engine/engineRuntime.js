@@ -226,6 +226,8 @@ class EngineRuntime {
     this.feePolicyLoadErrors = [];
     this.orderChanceCacheUpdatedAt = null;
     this.accountBalanceUpdatedAt = null;
+    this.lastExecutionBalanceRefreshAt = 0;
+    this.balanceRefreshMinIntervalMs = options.balanceRefreshMinIntervalMs ?? 300;
     this.activeRealExecutionCount = 0;
     this.executionCooldownMs = options.executionCooldownMs || 5000;
     this.lastExecutionByCycleId = new Map();
@@ -233,8 +235,16 @@ class EngineRuntime {
     this.snapshotTimer = null;
     this.deltaTimer = null;
     this.fallbackTimer = null;
+    this.privateCacheTimer = null;
     this.fallbackPollInFlight = false;
+    this.privateCacheRefreshInFlight = false;
     this.validationStartTimer = null;
+    this.privateCacheRefreshIntervalMs = options.privateCacheRefreshIntervalMs ||
+      Number.parseInt(process.env.Q_GAGARIN_PRIVATE_CACHE_REFRESH_INTERVAL_MS || "", 10) ||
+      Math.max(1000, Math.min(
+        15000,
+        Math.floor(Number(this.runtimeConfig.executionPolicy.executionGuards.accountBalanceTtlMs || 30000) / 2),
+      ));
     this.preparationPromise = null;
     this.preparationTimeoutMs = Number.parseInt(process.env.Q_GAGARIN_PREPARATION_TIMEOUT_MS || "120000", 10);
     this.preparationMinCoverageRatio = Number(process.env.Q_GAGARIN_PREPARATION_MIN_COVERAGE_RATIO || "0.95");
@@ -392,6 +402,11 @@ class EngineRuntime {
         this.logStore.append("errors", { source: "fallback", message: error.message }).catch(() => {});
       });
     }, Math.max(this.state.staleOrderbookMs, 5000));
+    this.privateCacheTimer = setInterval(() => {
+      this.refreshRunningPrivateCaches().catch((error) => {
+        this.logStore.append("errors", { source: "private-cache-refresh", message: error.message }).catch(() => {});
+      });
+    }, this.privateCacheRefreshIntervalMs);
 
     return this;
   }
@@ -401,6 +416,7 @@ class EngineRuntime {
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     if (this.deltaTimer) clearInterval(this.deltaTimer);
     if (this.fallbackTimer) clearInterval(this.fallbackTimer);
+    if (this.privateCacheTimer) clearInterval(this.privateCacheTimer);
     if (this.state && typeof this.state.stopScheduler === "function") {
       this.state.stopScheduler();
     }
@@ -1247,12 +1263,22 @@ class EngineRuntime {
       nowMs - Number(timestamp) <= Number(ttlMs || 0);
   }
 
-  orderChanceFreshnessStatus(nowMs = Date.now()) {
-    const requiredMarkets = this.requiredFeePolicyMarkets();
+  orderChanceFreshnessStatus(markets = this.requiredFeePolicyMarkets(), nowMs = Date.now()) {
+    let requestedMarkets = markets;
+    let requestedNowMs = nowMs;
+
+    if (typeof markets === "number") {
+      requestedMarkets = this.requiredFeePolicyMarkets();
+      requestedNowMs = markets;
+    }
+
+    const requiredMarkets = [...new Set((Array.isArray(requestedMarkets) && requestedMarkets.length > 0
+      ? requestedMarkets
+      : this.requiredFeePolicyMarkets()).filter(Boolean))].sort();
     const timestampFresh = this.isFresh(
       this.orderChanceCacheUpdatedAt,
       this.runtimeConfig.executionPolicy.executionGuards.orderChanceTtlMs,
-      nowMs,
+      requestedNowMs,
     );
     const missingFeePolicyMarkets = requiredMarkets.filter((market) => !this.feePolicyByMarket.has(market));
     const missingMarketPolicyMarkets = requiredMarkets.filter((market) => !this.marketPolicyByMarket.has(market));
@@ -1266,7 +1292,7 @@ class EngineRuntime {
     });
     const expiredFeePolicyMarkets = requiredMarkets.filter((market) => {
       const policy = this.feePolicyByMarket.get(market);
-      return policy && isFeePolicyExpired(policy, nowMs);
+      return policy && isFeePolicyExpired(policy, requestedNowMs);
     });
     const loadErrorMarkets = this.feePolicyLoadErrors.map((error) => error.market || null);
 
@@ -1291,6 +1317,16 @@ class EngineRuntime {
 
   isOrderChanceFresh() {
     return this.orderChanceFreshnessStatus().fresh;
+  }
+
+  planMarkets(plan = {}) {
+    const steps = plan.cycle && Array.isArray(plan.cycle.steps) ? plan.cycle.steps : [];
+    return [...new Set(steps.map((step) => step && step.market).filter(Boolean))].sort();
+  }
+
+  isPlanOrderChanceFresh(plan = {}) {
+    const markets = this.planMarkets(plan);
+    return this.orderChanceFreshnessStatus(markets.length > 0 ? markets : undefined).fresh;
   }
 
   isAccountBalanceFresh() {
@@ -1340,6 +1376,166 @@ class EngineRuntime {
     return this.restPermissions;
   }
 
+  async refreshAccountBalancesAfterExecution(metadata = {}) {
+    if (!this.restClient || typeof this.restClient.getAccounts !== "function") {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "ACCOUNT_BALANCE_REFRESH_UNAVAILABLE",
+      };
+    }
+
+    const nowMs = Date.now();
+    const force = metadata.force === true;
+    if (!force && nowMs - this.lastExecutionBalanceRefreshAt < this.balanceRefreshMinIntervalMs) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "ACCOUNT_BALANCE_REFRESH_THROTTLED",
+      };
+    }
+
+    this.lastExecutionBalanceRefreshAt = nowMs;
+    try {
+      const accounts = await this.restClient.getAccounts();
+      this.updateAccountBalances(accounts || [], Date.now());
+      return {
+        ok: true,
+        accountCount: Array.isArray(accounts) ? accounts.length : 0,
+        reason: metadata.reason || null,
+      };
+    } catch (error) {
+      await this.logStore.append("events", {
+        type: "balance.refresh_failed",
+        mode: "REAL",
+        engineState: this.machine.state,
+        reason: metadata.reason || "EXECUTION_BALANCE_REFRESH",
+        planId: metadata.planId || null,
+        cycleId: metadata.cycleId || null,
+        legIndex: metadata.legIndex || null,
+        market: metadata.market || null,
+        message: error.message,
+      });
+      return {
+        ok: false,
+        reason: "ACCOUNT_BALANCE_REFRESH_FAILED",
+        message: error.message,
+      };
+    }
+  }
+
+  async refreshRunningPrivateCaches() {
+    if (!String(this.runtimeConfig.runMode || "").startsWith("REAL_")) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "NOT_REAL_RUN",
+      };
+    }
+
+    if (![STATES.PREPARING, STATES.RUNNING].includes(this.machine.state)) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "ENGINE_NOT_ACTIVE",
+      };
+    }
+
+    if (this.privateCacheRefreshInFlight) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "PRIVATE_CACHE_REFRESH_IN_FLIGHT",
+      };
+    }
+
+    this.privateCacheRefreshInFlight = true;
+    try {
+      const accountAgeMs = this.accountBalanceUpdatedAt ? Date.now() - this.accountBalanceUpdatedAt : Infinity;
+      if (accountAgeMs >= this.privateCacheRefreshIntervalMs || !this.isAccountBalanceFresh()) {
+        return this.refreshAccountBalancesAfterExecution({
+          reason: "PERIODIC_ACCOUNT_REFRESH",
+          force: true,
+        });
+      }
+
+      return {
+        ok: true,
+        skipped: true,
+        reason: "ACCOUNT_BALANCE_STILL_FRESH",
+      };
+    } finally {
+      this.privateCacheRefreshInFlight = false;
+    }
+  }
+
+  async ensureExecutionPrivateCaches(plan = {}) {
+    const markets = this.planMarkets(plan);
+    const refreshed = {
+      accounts: false,
+      orderChanceMarkets: [],
+    };
+
+    if (
+      this.accountBalanceUpdatedAt !== null &&
+      !this.isAccountBalanceFresh() &&
+      this.restClient &&
+      typeof this.restClient.getAccounts === "function"
+    ) {
+      const result = await this.refreshAccountBalancesAfterExecution({
+        reason: "EXECUTION_PRECHECK_ACCOUNT_REFRESH",
+        force: true,
+        planId: plan.planId || null,
+        cycleId: plan.cycleId || (plan.cycle && plan.cycle.cycleId) || null,
+        startAsset: plan.startAsset || (plan.cycle && plan.cycle.startAsset) || null,
+        strategyId: plan.strategyId || this.runtimeConfig.activeStrategyId,
+      });
+      if (!result || result.ok !== true) {
+        return {
+          ok: false,
+          reason: result && result.reason || "ACCOUNT_BALANCE_REFRESH_FAILED",
+          refreshed,
+        };
+      }
+      refreshed.accounts = true;
+    }
+
+    const chanceStatus = markets.length > 0 ? this.orderChanceFreshnessStatus(markets) : { fresh: true };
+    if (!chanceStatus.fresh) {
+      if (!this.restClient || typeof this.restClient.getOrderChance !== "function") {
+        return {
+          ok: false,
+          reason: "ORDER_CHANCE_REFRESH_UNAVAILABLE",
+          refreshed,
+        };
+      }
+
+      const result = await this.refreshFeePolicies(markets);
+      refreshed.orderChanceMarkets = markets.slice();
+      const refreshedStatus = this.orderChanceFreshnessStatus(markets);
+
+      if (!refreshedStatus.fresh) {
+        return {
+          ok: false,
+          reason: "ORDER_CHANCE_REFRESH_FAILED",
+          refreshed,
+          orderChance: {
+            loadedCount: result.loadedCount,
+            requiredCount: result.requiredCount,
+            errors: result.errors,
+            status: refreshedStatus,
+          },
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      refreshed,
+      context: this.currentGuardContext(plan),
+    };
+  }
+
   validationDepthFresh() {
     const status = this.state.getOrderbookStoreStatus();
     const validation = status.validation || null;
@@ -1350,14 +1546,17 @@ class EngineRuntime {
     return validation.staleCount === 0;
   }
 
-  currentGuardContext() {
+  currentGuardContext(plan = null) {
     const balanceSnapshot = this.balanceTracker.snapshot();
+    const planMarkets = plan ? this.planMarkets(plan) : [];
 
     return {
       emergencyStopActive: this.emergencyStop.active,
       emergencyStopReason: this.emergencyStop.reason,
       privateWsConnected: this.privateWsStatus.status === "open",
-      orderChanceFresh: this.isOrderChanceFresh(),
+      orderChanceFresh: planMarkets.length > 0
+        ? this.orderChanceFreshnessStatus(planMarkets).fresh
+        : this.isOrderChanceFresh(),
       accountBalanceFresh: this.isAccountBalanceFresh(),
       availableBalances: balanceSnapshot.availableBalances,
       lockedBalances: balanceSnapshot.lockedBalances,
@@ -1420,6 +1619,37 @@ class EngineRuntime {
       return null;
     }
 
+    if (this.runtimeConfig.runMode !== "DRY_RUN") {
+      const configuredMaxActiveTriangleExecutions =
+        this.runtimeConfig.executionPolicy &&
+        this.runtimeConfig.executionPolicy.realRunLimits &&
+        this.runtimeConfig.executionPolicy.realRunLimits.maxActiveTriangleExecutions;
+      const maxActiveTriangleExecutions = configuredMaxActiveTriangleExecutions === null ||
+        configuredMaxActiveTriangleExecutions === undefined
+        ? 1
+        : Number(configuredMaxActiveTriangleExecutions);
+      if (maxActiveTriangleExecutions > 0 && this.activeRealExecutionCount >= maxActiveTriangleExecutions) {
+        await this.logStore.append("events", {
+          type: "execution.skipped",
+          mode: "REAL",
+          engineState: this.machine.state,
+          planId: plan.planId,
+          cycleId: plan.cycleId || (plan.cycle && plan.cycle.cycleId),
+          startAsset: plan.startAsset || (plan.cycle && plan.cycle.startAsset),
+          strategyId: plan.strategyId || this.runtimeConfig.activeStrategyId,
+          reason: "REAL_EXECUTION_BUSY",
+          activeRealExecutionCount: this.activeRealExecutionCount,
+          maxActiveTriangleExecutions,
+        });
+        return {
+          ok: false,
+          reason: "REAL_EXECUTION_BUSY",
+          activeRealExecutionCount: this.activeRealExecutionCount,
+          maxActiveTriangleExecutions,
+        };
+      }
+    }
+
     if (this.shouldThrottleExecution(plan)) {
       return null;
     }
@@ -1459,12 +1689,35 @@ class EngineRuntime {
 
     this.activeRealExecutionCount += 1;
     try {
+      const privateCaches = await this.ensureExecutionPrivateCaches(plan);
+      if (!privateCaches.ok) {
+        await this.logStore.append("events", {
+          type: "execution.skipped",
+          mode: "REAL",
+          engineState: this.machine.state,
+          planId: plan.planId,
+          cycleId: plan.cycleId || (plan.cycle && plan.cycle.cycleId),
+          startAsset: plan.startAsset || (plan.cycle && plan.cycle.startAsset),
+          strategyId: plan.strategyId || this.runtimeConfig.activeStrategyId,
+          reason: privateCaches.reason,
+          refreshed: privateCaches.refreshed,
+          orderChance: privateCaches.orderChance,
+        });
+        return {
+          ok: false,
+          reason: privateCaches.reason,
+          refreshed: privateCaches.refreshed,
+        };
+      }
+
+      const initialGuardContext = privateCaches.context || this.currentGuardContext(plan);
       const result = await this.realExecutor.execute(plan, {
-        ...this.currentGuardContext(),
-        getGuardContext: () => this.currentGuardContext(),
+        ...initialGuardContext,
+        getGuardContext: () => this.currentGuardContext(plan),
         getValidationOrderbooks: () => this.state.getValidationOrderbooks(),
         getMarketPolicy: (market) => this.marketPolicyByMarket.get(market) || null,
         getFeePolicy: (market) => this.feePolicyByMarket.get(market) || null,
+        refreshAccountBalances: (metadata) => this.refreshAccountBalancesAfterExecution(metadata),
       });
 
       if (result && result.ok) {

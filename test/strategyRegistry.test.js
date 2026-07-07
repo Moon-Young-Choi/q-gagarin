@@ -133,7 +133,6 @@ test("strategies build execution plans through the shared contract", () => {
   assert.equal(baselinePlan.strategyId, "topOfBookBaseline");
   assert.equal(baselinePlan.strategyVersion, baseline.version);
   assert.equal(residualPlan.strategyId, "bestLevelResidualIoc");
-  assert.equal(residualPlan.recoverOnRepriceLoss, true);
   assert.equal(depthAware.explain({ reason: "DEPTH_VALIDATED" }), "DEPTH_VALIDATED");
 });
 

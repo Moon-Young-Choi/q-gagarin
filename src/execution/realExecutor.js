@@ -1,5 +1,5 @@
 const { parseMarket } = require("../lib/marketGraph");
-const { resolveLegFeeRate, simulateCycleWithDepth } = require("../lib/depthSimulator");
+const { resolveLegFeeRate } = require("../lib/depthSimulator");
 const { DEFAULT_EXECUTION_MODE, BEST_IOC_EXECUTION_MODE } = require("./executionModes");
 const {
   DEFAULT_PARTIAL_FILL_POLICY,
@@ -43,18 +43,6 @@ function finiteNumber(value) {
   }
 
   return Number.isFinite(Number(value));
-}
-
-function orderbookMeta(orderbook) {
-  return {
-    market: orderbook && orderbook.market,
-    traceId: orderbook && orderbook.traceId,
-    localSequence: orderbook && orderbook.localSequence,
-    exchangeTimestampMs: orderbook && (orderbook.exchangeTimestampMs || orderbook.timestamp),
-    serverReceivedAtMs: orderbook && (orderbook.serverReceivedAtMs || orderbook.receivedAt),
-    orderbookUnit: orderbook && orderbook.orderbookUnit,
-    streamType: orderbook && orderbook.streamType,
-  };
 }
 
 function marketPolicyMeta(policy) {
@@ -193,30 +181,6 @@ function cycleExecutionMeta(cycle = {}) {
   };
 }
 
-function recoveryStepFor(cycle = {}, fromAsset, toAsset) {
-  const markets = Array.isArray(cycle.markets) && cycle.markets.length > 0
-    ? cycle.markets
-    : [...new Set((cycle.steps || []).map((step) => step.market).filter(Boolean))];
-
-  for (const market of markets) {
-    const { quote, base } = parseMarket(market);
-    if (
-      (fromAsset === quote && toAsset === base) ||
-      (fromAsset === base && toAsset === quote)
-    ) {
-      return {
-        index: (cycle.steps || []).length,
-        fromAsset,
-        toAsset,
-        market,
-        recovery: true,
-      };
-    }
-  }
-
-  return null;
-}
-
 class RealExecutor {
   constructor(options = {}) {
     this.restClient = options.restClient;
@@ -284,6 +248,33 @@ class RealExecutor {
     }
 
     return context;
+  }
+
+  async refreshAccountBalances(context = {}, metadata = {}) {
+    if (typeof context.refreshAccountBalances !== "function") {
+      return null;
+    }
+
+    try {
+      return await context.refreshAccountBalances(metadata);
+    } catch (error) {
+      this.emit("events", {
+        type: "balance.refresh_failed",
+        planId: metadata.planId || null,
+        cycleId: metadata.cycleId || null,
+        startAsset: metadata.startAsset || null,
+        strategyId: metadata.strategyId || null,
+        legIndex: metadata.legIndex || null,
+        market: metadata.market || null,
+        reason: metadata.reason || "EXECUTION_BALANCE_REFRESH",
+        message: error.message,
+      });
+      return {
+        ok: false,
+        reason: "ACCOUNT_BALANCE_REFRESH_FAILED",
+        message: error.message,
+      };
+    }
   }
 
   executionFailure(reason) {
@@ -465,346 +456,6 @@ class RealExecutor {
       orderType: plan.orderType || "limit",
       timeInForce: plan.timeInForce || "ioc",
     });
-  }
-
-  repriceRecoveryDecision(plan, step, amount, validationOrderbooks) {
-    if (plan.recoverOnRepriceLoss !== true || step.index <= 0) {
-      return { recover: false };
-    }
-
-    const remainingSteps = (plan.cycle.steps || []).slice(step.index);
-    if (remainingSteps.length === 0) {
-      return { recover: false };
-    }
-
-    const simulated = simulateCycleWithDepth(
-      {
-        ...plan.cycle,
-        steps: remainingSteps,
-      },
-      validationOrderbooks,
-      amount,
-      plan.feeRate || 0,
-      {
-        nowMs: Date.now(),
-        staleOrderbookMs: plan.staleOrderbookMs,
-        maxDepthLevels: plan.maxDepthLevels || 1,
-        validateOrderTotals: true,
-        feePolicyByMarket: plan.feePolicyByMarket,
-        marketPolicyByMarket: plan.marketPolicyByMarket,
-        useDefaultFeePolicy: plan.useDefaultFeePolicy === true,
-        expectedMaker: plan.expectedMaker === true,
-        orderType: plan.orderType || "limit",
-        timeInForce: plan.timeInForce || "ioc",
-      },
-    );
-    const expectedOutput = Number(plan.expectedOutputAmount);
-    const minOutput = Number.isFinite(expectedOutput) && expectedOutput > 0
-      ? expectedOutput
-      : Number(plan.startAmount) * (1 + Number(this.runtimeConfig.candidateValidation &&
-        this.runtimeConfig.candidateValidation.minNetProfitRate || 0));
-
-    if (!simulated.available) {
-      return {
-        recover: true,
-        reason: simulated.rejectionCode || "REPRICE_DEPTH_UNAVAILABLE",
-        projectedOutputAmount: null,
-        expectedOutputAmount: minOutput,
-      };
-    }
-
-    if (!(simulated.outputAmount >= minOutput)) {
-      return {
-        recover: true,
-        reason: "REPRICE_PROFIT_DETERIORATED",
-        projectedOutputAmount: simulated.outputAmount,
-        projectedProfitRate: Number(plan.startAmount) > 0
-          ? simulated.outputAmount / Number(plan.startAmount) - 1
-          : null,
-        expectedOutputAmount: minOutput,
-      };
-    }
-
-    return {
-      recover: false,
-      projectedOutputAmount: simulated.outputAmount,
-      projectedProfitRate: Number(plan.startAmount) > 0
-        ? simulated.outputAmount / Number(plan.startAmount) - 1
-        : null,
-      expectedOutputAmount: minOutput,
-    };
-  }
-
-  async executeRecoveryToStart(
-    plan,
-    fromAsset,
-    amount,
-    validationOrderbooks,
-    context,
-    reason,
-    details,
-    legResults,
-    cycleStartPerfNs = null,
-  ) {
-    const startAsset = plan.startAsset || (plan.cycle && plan.cycle.startAsset);
-    const recoveryStep = recoveryStepFor(plan.cycle, fromAsset, startAsset);
-    const legIndex = (plan.cycle.steps || []).length + 1;
-
-    if (!recoveryStep) {
-      this.emitCycleAborted(plan, {
-        legIndex,
-        reason: "RECOVERY_ROUTE_UNAVAILABLE",
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        ...details,
-      }, { legacyType: "cycle.real_fail" });
-      return {
-        ok: false,
-        reason: "RECOVERY_ROUTE_UNAVAILABLE",
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        legResults,
-        feeSummary: summarizeFees(legResults),
-      };
-    }
-
-    const orderbook = getOrderbook(validationOrderbooks, recoveryStep.market);
-    if (!orderbook) {
-      this.emitCycleAborted(plan, {
-        legIndex,
-        market: recoveryStep.market,
-        reason: "RECOVERY_ORDERBOOK_UNAVAILABLE",
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        ...details,
-      }, { legacyType: "cycle.real_fail" });
-      return {
-        ok: false,
-        reason: "RECOVERY_ORDERBOOK_UNAVAILABLE",
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        legResults,
-        feeSummary: summarizeFees(legResults),
-      };
-    }
-
-    const identifier = this.orderManager.createIdentifier({
-      planId: plan.planId,
-      cycleId: plan.cycle.cycleId,
-      legIndex,
-    });
-    const marketPolicy = await this.marketPolicyForLeg(recoveryStep, context);
-    const feePolicy = await this.feePolicyForLeg(recoveryStep, context);
-    const feeRate = this.resolveFeeRateForLeg(recoveryStep, plan, feePolicy);
-    const order = this.buildOrderForLeg(recoveryStep, amount, orderbook, identifier, marketPolicy, null, {
-      feeRate,
-    });
-    const orderTotalCheck = validateOrderTotal(order, marketPolicy);
-
-    if (!orderTotalCheck.ok) {
-      this.emitCycleAborted(plan, {
-        legIndex,
-        market: recoveryStep.market,
-        reason: orderTotalCheck.rejectionReason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        orderTotal: orderTotalCheck.total,
-        minTotal: orderTotalCheck.minTotal,
-        maxTotal: orderTotalCheck.maxTotal,
-        ...details,
-      }, { legacyType: "cycle.real_fail" });
-      return {
-        ok: false,
-        reason: orderTotalCheck.rejectionReason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        legResults,
-        feeSummary: summarizeFees(legResults),
-      };
-    }
-
-    const legStartPerfNs = perfNowNs();
-    this.emitState(plan, "RECOVERY_PLANNED", {
-      legIndex,
-      market: recoveryStep.market,
-      fromAsset,
-      toAsset: startAsset,
-      inputAmount: amount,
-      originalReason: reason,
-      ...details,
-    });
-    this.emit("orders", {
-      type: "order.intent",
-      planId: plan.planId,
-      cycleId: plan.cycle.cycleId,
-      startAsset,
-      strategyId: plan.strategyId,
-      legIndex,
-      recovery: true,
-      originalReason: reason,
-      order,
-      marketPolicy: marketPolicyMeta(marketPolicy),
-      feePolicy,
-    });
-
-    let submission;
-    this.riskGuard.recordOrderOpened();
-    try {
-      submission = await this.orderManager.submitOrder(order, {
-        planId: plan.planId,
-        cycleId: plan.cycle.cycleId,
-        startAsset,
-        strategyId: plan.strategyId,
-        engineState: this.activeEngineState,
-        legIndex,
-        market: recoveryStep.market,
-        recovery: true,
-      });
-    } catch (error) {
-      const failureReason = this.orderSubmitFailureReason(error);
-      this.emitCycleAborted(plan, {
-        legIndex,
-        market: recoveryStep.market,
-        reason: failureReason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        error: this.orderSubmitFailureDetails(error),
-        ...details,
-      }, { legacyType: "cycle.real_fail" });
-      return {
-        ok: false,
-        reason: failureReason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        legResults,
-        feeSummary: summarizeFees(legResults),
-      };
-    } finally {
-      this.riskGuard.recordOrderClosed();
-    }
-
-    const reconciliation = await this.orderManager.reconcileSubmittedOrder({
-      orderAck: submission.ack,
-      identifier: submission.identifier,
-      submittedOrder: submission.order,
-      metadata: {
-        planId: plan.planId,
-        cycleId: plan.cycle.cycleId,
-        startAsset,
-        strategyId: plan.strategyId,
-        engineState: this.activeEngineState,
-        legIndex,
-        market: recoveryStep.market,
-        recovery: true,
-      },
-    });
-    const fill = this.amountAfterFill(recoveryStep, reconciliation.order, order);
-
-    if (!fill.ok) {
-      this.emitCycleAborted(plan, {
-        legIndex,
-        market: recoveryStep.market,
-        reason: fill.reason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        ...details,
-      }, { legacyType: "cycle.real_fail" });
-      return {
-        ok: false,
-        reason: fill.reason,
-        originalReason: reason,
-        residualAsset: fromAsset,
-        actualAmount: amount,
-        legResults,
-        feeSummary: summarizeFees(legResults),
-      };
-    }
-
-    const executionLatency = {
-      orderAckMs: diffNsToMs(submission.orderAckPerfNs, submission.orderSubmitStartPerfNs),
-      reconciliationMs: diffNsToMs(reconciliation.reconciliationDonePerfNs, reconciliation.reconciliationStartedPerfNs),
-      orderQueryMs: diffNsToMs(reconciliation.orderQueryDonePerfNs, reconciliation.reconciliationStartedPerfNs),
-      privateWsFillMs: diffNsToMs(reconciliation.privateWsFillReceivePerfNs, submission.orderSubmitStartPerfNs),
-      legTotalMs: diffNsToMs(perfNowNs(), legStartPerfNs),
-      source: reconciliation.source,
-    };
-    const recoveryLeg = {
-      legIndex,
-      market: recoveryStep.market,
-      side: order.side,
-      fromAsset,
-      toAsset: startAsset,
-      inputAmount: amount,
-      outputAmount: fill.amount,
-      avgPrice: fill.avgPrice,
-      submittedPrice: order.price,
-      observedBestPrice: order.observedBestPrice,
-      paidFee: fill.paidFee,
-      tradeFee: fill.tradeFee,
-      feeRate: order.feeRate,
-      feeAmount: fill.feeAmount,
-      feeAsset: fill.feeAsset,
-      tradeAmount: fill.tradeAmount,
-      grossOutputAmount: fill.grossOutputAmount,
-      netOutputAmount: fill.netOutputAmount,
-      recovery: true,
-      recoveryReason: reason,
-      bestLevelTouchRatio: order.bestLevelTouchRatio,
-      uuid: reconciliation.order && reconciliation.order.uuid,
-      identifier: submission.identifier,
-      source: reconciliation.source,
-      executionLatency,
-      latencySummary: summarizeLatency({ execution: executionLatency }),
-    };
-    const recoveredLegResults = [...legResults, recoveryLeg];
-    const pnl = fill.amount - Number(plan.startAmount);
-    const feeSummary = summarizeFees(recoveredLegResults);
-    const cycleExecutionLatency = {
-      cycleTotalMs: diffNsToMs(perfNowNs(), cycleStartPerfNs),
-      legs: recoveredLegResults.map((leg) => ({
-        legIndex: leg.legIndex,
-        market: leg.market,
-        ...(leg.executionLatency || {}),
-      })),
-    };
-
-    this.emitCycleAborted(plan, {
-      legIndex,
-      market: recoveryStep.market,
-      reason,
-      recoveredToStart: true,
-      recoveryAsset: startAsset,
-      recoveryOutputAmount: fill.amount,
-      outputAmount: fill.amount,
-      pnl,
-      profitRate: Number(plan.startAmount) > 0 ? pnl / Number(plan.startAmount) : null,
-      legResults: recoveredLegResults,
-      feeSummary,
-      cycleExecutionLatency,
-      ...details,
-    });
-
-    return {
-      ok: false,
-      reason,
-      recoveredToStart: true,
-      recoveryAsset: startAsset,
-      outputAmount: fill.amount,
-      pnl,
-      profitRate: Number(plan.startAmount) > 0 ? pnl / Number(plan.startAmount) : null,
-      legResults: recoveredLegResults,
-      feeSummary,
-      cycleExecutionLatency,
-    };
   }
 
   buildOrderForLeg(step, amount, orderbook, identifier, marketPolicy = null, liquidityPolicyOverride = null, feeContext = {}) {
@@ -1104,57 +755,9 @@ class RealExecutor {
         inputAmount: legInputAmount,
       });
 
-      if (step.index > 0) {
-        this.emitState(plan, `REPRICE_BEFORE_LEG_${legIndex}`, {
-          legIndex,
-          market: step.market,
-          inputAmount: legInputAmount,
-        });
-      }
-
       const validationOrderbooks = await this.validationOrderbooksForLeg(plan, context);
       const orderbook = getOrderbook(validationOrderbooks, step.market);
-      const recoveryDecision = this.repriceRecoveryDecision(plan, step, amount, validationOrderbooks);
 
-      if (recoveryDecision.recover) {
-        this.emitState(plan, "REPRICE_RECOVERY_TRIGGERED", {
-          legIndex,
-          market: step.market,
-          reason: recoveryDecision.reason,
-          residualAsset: step.fromAsset,
-          actualAmount: amount,
-          projectedOutputAmount: recoveryDecision.projectedOutputAmount,
-          projectedProfitRate: recoveryDecision.projectedProfitRate,
-          expectedOutputAmount: recoveryDecision.expectedOutputAmount,
-        });
-        return this.executeRecoveryToStart(
-          plan,
-          step.fromAsset,
-          amount,
-          validationOrderbooks,
-          context,
-          recoveryDecision.reason,
-          {
-            projectedOutputAmount: recoveryDecision.projectedOutputAmount,
-            projectedProfitRate: recoveryDecision.projectedProfitRate,
-            expectedOutputAmount: recoveryDecision.expectedOutputAmount,
-          },
-          legResults,
-          cycleStartPerfNs,
-        );
-      }
-
-      this.emit("orders", {
-        type: "execution.reprice",
-        planId: plan.planId,
-        cycleId: plan.cycle.cycleId,
-        startAsset: plan.startAsset || plan.cycle.startAsset,
-        strategyId: plan.strategyId,
-        legIndex,
-        market: step.market,
-        inputAmount: legInputAmount,
-        orderbook: orderbookMeta(orderbook),
-      });
       const identifier = this.orderManager.createIdentifier({
         planId: plan.planId,
         cycleId: plan.cycle.cycleId,
@@ -1363,6 +966,16 @@ class RealExecutor {
           error: errorDetails,
           emergencyStop: failure.emergencyStop,
         }, { legacyType: "cycle.real_fail" });
+        await this.refreshAccountBalances(context, {
+          reason: "ORDER_SUBMIT_FAILED",
+          force: true,
+          planId: plan.planId,
+          cycleId: plan.cycle.cycleId,
+          startAsset: plan.startAsset || plan.cycle.startAsset,
+          strategyId: plan.strategyId,
+          legIndex,
+          market: step.market,
+        });
         return {
           ok: false,
           reason,
@@ -1455,6 +1068,16 @@ class RealExecutor {
           actualAmount: amount,
           emergencyStop: failure.emergencyStop,
         }, { legacyType: "cycle.real_fail" });
+        await this.refreshAccountBalances(context, {
+          reason: fill.reason,
+          force: true,
+          planId: plan.planId,
+          cycleId: plan.cycle.cycleId,
+          startAsset: plan.startAsset || plan.cycle.startAsset,
+          strategyId: plan.strategyId,
+          legIndex,
+          market: step.market,
+        });
         return {
           ok: false,
           reason: fill.reason,
@@ -1578,6 +1201,16 @@ class RealExecutor {
         executionLatency,
         latencySummary,
       });
+      await this.refreshAccountBalances(context, {
+        reason: fill.isPartial ? "ORDER_PARTIAL" : "ORDER_FILL",
+        force: false,
+        planId: plan.planId,
+        cycleId: plan.cycle.cycleId,
+        startAsset: plan.startAsset || plan.cycle.startAsset,
+        strategyId: plan.strategyId,
+        legIndex,
+        market: step.market,
+      });
 
       const isLastLeg = step.index >= plan.cycle.steps.length - 1;
       const minOrderAmount = Number(this.runtimeConfig.candidateValidation &&
@@ -1611,6 +1244,16 @@ class RealExecutor {
           actualAmount: amount,
           emergencyStop: failure.emergencyStop,
         }, { legacyType: "cycle.real_fail" });
+        await this.refreshAccountBalances(context, {
+          reason: partialFillDecision.rejectionReason,
+          force: true,
+          planId: plan.planId,
+          cycleId: plan.cycle.cycleId,
+          startAsset: plan.startAsset || plan.cycle.startAsset,
+          strategyId: plan.strategyId,
+          legIndex,
+          market: step.market,
+        });
         return {
           ok: false,
           reason: partialFillDecision.rejectionReason,
@@ -1648,6 +1291,14 @@ class RealExecutor {
       feeSummary,
       legResults,
       cycleExecutionLatency,
+    });
+    await this.refreshAccountBalances(context, {
+      reason: "CYCLE_DONE",
+      force: true,
+      planId: plan.planId,
+      cycleId: plan.cycle && plan.cycle.cycleId,
+      startAsset: plan.startAsset || (plan.cycle && plan.cycle.startAsset),
+      strategyId: plan.strategyId,
     });
 
     return {

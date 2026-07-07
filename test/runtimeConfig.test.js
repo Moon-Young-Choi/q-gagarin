@@ -39,14 +39,12 @@ test("runtime config loader backfills newly added defaults for older config file
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "q-gagarin-runtime-config-"));
   const configPath = path.join(dir, "runtime.json");
   const staleConfig = JSON.parse(JSON.stringify(DEFAULT_RUNTIME_CONFIG));
-  delete staleConfig.executionPolicy.recoverOnRepriceLoss;
   delete staleConfig.candidateValidation.sizingMode;
 
   fs.writeFileSync(configPath, `${JSON.stringify(staleConfig, null, 2)}\n`);
 
   const config = loadRuntimeConfig({ configPath });
 
-  assert.equal(config.executionPolicy.recoverOnRepriceLoss, true);
   assert.equal(config.candidateValidation.sizingMode, "configured");
 });
 
